@@ -39,6 +39,8 @@ pnpm db:import-postgres <snapshot.json>
 - `db:seed` is the only command allowed to create demo tasks. API reads must never seed or mutate demo data.
 - Reminder dispatch claims `pending` rows with an atomic conditional update; duplicate QQ input is guarded by the unique `(channel, externalMessageId)` receipt index.
 - The no-database in-memory store is a development fallback, not a reduced domain implementation. Its cross-date schedule/reschedule/undo projections must match SQLite even though persistence mechanics differ.
+- Multi-day Dashboard reads use `ScheduleStore.getSnapshots(dates)`. SQLite queries each range-owned table once, builds a task lookup Map for block projection, and preserves requested date order; do not implement a range by looping over `getSnapshot()`.
+- Query indexes must follow actual filters and ordering. The current baseline covers workspace/date schedule reads, workspace/weekday availability, recurrence lookup, due reminder delivery, recent reminder/ChangeSet ordering, and pending QQ confirmation lookup. Generate every index change as a Drizzle migration and validate it on a temporary database before deployment.
 
 ### 4. Validation & Error Matrix
 
@@ -70,6 +72,7 @@ pnpm db:import-postgres <snapshot.json>
 - A migration/import rehearsal must compare all 15 PostgreSQL table counts with SQLite and then verify an API date query returns the imported tasks/blocks.
 - A backup/restore rehearsal must restore into a temporary file, pass `quick_check`, and preserve the task count.
 - Focused adapter tests must compare cross-date placement/reschedule origin removal, target insertion, task-date updates, and undo restoration for the in-memory fallback; SQLite API/browser tests cover the durable equivalent.
+- Range projection tests must assert requested ordering for both adapters; `pnpm db:check` plus a temporary `db:migrate` must include every generated index migration.
 - Compose acceptance must prove the app is healthy, the PWA worker can write its heartbeat through the shared file, and `/api/status` plus `/api/schedule` return real SQLite data.
 
 ### 7. Wrong vs Correct

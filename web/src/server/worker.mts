@@ -1,17 +1,32 @@
 import { config } from "dotenv";
 config({ path: ".env.local" });
-import { QQBot } from "@tencent-connect/qqbot-nodejs";
-import { and, desc, eq, lte, lt } from "drizzle-orm";
+import { QQBot, type ReplyTarget } from "@tencent-connect/qqbot-nodejs";
+import { and, eq, lte, lt } from "drizzle-orm";
 import { getActiveScheduleStore } from "@/features/schedule/data/active-store";
 import type { ScheduleTask } from "@/features/schedule/domain/types";
 import { evaluateDailySummary } from "@/features/schedule/domain/reminder-policy";
 import { parseScheduleCommand } from "@/server/ai/provider";
-import { qqConfigError, qqIsConfigured, reminderChannelIsEnabled, sanitizedQqError } from "@/server/qq/config";
+import { qqConfigError, qqInlineKeyboardIsEnabled, qqIsConfigured, reminderChannelIsEnabled, sanitizedQqError } from "@/server/qq/config";
 import { parseQqCommandMode, parseQqControlCommand } from "@/server/qq/command-mode";
 import { getDb } from "@/server/db";
 import { commandReceipts, reminders } from "@/server/db/schema";
 import { dailySummaryTime, reminderMessage, REMINDER_WORKSPACE_ID, todayInShanghai } from "@/server/reminders";
 import { recordWorkerHealth } from "@/server/worker-health";
+import {
+  buildQqProposalPreview,
+  cancelQqScheduleProposal,
+  claimQqScheduleProposal,
+  createQqScheduleProposal,
+  findQqScheduleProposal,
+  formatQqScheduleProposal,
+  markQqScheduleProposalApplied,
+  parseQqProposalAction,
+  parseQqProposalButtonData,
+  qqProposalKeyboard,
+  releaseQqScheduleProposal,
+} from "@/server/qq/schedule-proposals";
+import type { QqScheduleProposalIntent, QqScheduleProposalPreview } from "@/server/qq/schedule-proposal-types";
+import { renderQqProposalPng, shouldRenderQqProposalImage } from "@/server/qq/schedule-proposal-image";
 
 async function ensureDailySummary() {
   const db = getDb();
@@ -47,24 +62,128 @@ async function dispatchReminders(bot: QQBot) {
   }
 }
 
-async function claimCommand(messageId: string, senderId: string) {
-  const [receipt] = await getDb().insert(commandReceipts).values({ id: crypto.randomUUID(), workspaceId: REMINDER_WORKSPACE_ID, channel: "qq", externalMessageId: messageId, senderId, status: "received" }).onConflictDoNothing().returning();
+async function claimCommand(messageId: string, senderId: string, channel = "qq") {
+  const [receipt] = await getDb().insert(commandReceipts).values({ id: crypto.randomUUID(), workspaceId: REMINDER_WORKSPACE_ID, channel, externalMessageId: messageId, senderId, status: "received" }).onConflictDoNothing().returning();
   return receipt;
-}
-
-type PendingCommand = { kind: "insert"; task: ScheduleTask; optimize: true } | { kind: "reschedule"; taskId: string; date: string; startMinutes: number; optimize: true };
-
-async function pendingConfirmation(senderId: string) {
-  const [receipt] = await getDb().select().from(commandReceipts).where(and(eq(commandReceipts.workspaceId, REMINDER_WORKSPACE_ID), eq(commandReceipts.channel, "qq"), eq(commandReceipts.senderId, senderId), eq(commandReceipts.status, "pending_confirmation"))).orderBy(desc(commandReceipts.createdAt)).limit(1);
-  if (!receipt?.payload || typeof receipt.payload !== "object") return { receipt: undefined, command: undefined };
-  const payload = receipt.payload as { kind?: string; task?: ScheduleTask; taskId?: string; date?: string; startMinutes?: number; optimize?: boolean };
-  if (payload.kind === "reschedule" && payload.optimize === true && payload.taskId && payload.date && typeof payload.startMinutes === "number") return { receipt, command: { kind: "reschedule" as const, taskId: payload.taskId, date: payload.date, startMinutes: payload.startMinutes, optimize: true as const } };
-  if (payload.kind === "insert" && payload.optimize === true && payload.task) return { receipt, command: { kind: "insert" as const, task: payload.task, optimize: true as const } };
-  return { receipt: undefined, command: undefined };
 }
 
 async function updateReceipt(id: string, status: "pending_confirmation" | "processed" | "failed", responseText: string, payload?: unknown) {
   await getDb().update(commandReceipts).set({ status, responseText, ...(payload ? { payload } : {}), updatedAt: new Date() }).where(eq(commandReceipts.id, id));
+}
+
+async function finishReceivedReceipt(id: string, responseText: string, payload?: unknown) {
+  await getDb().update(commandReceipts).set({ status: "processed", responseText, ...(payload ? { payload } : {}), updatedAt: new Date() }).where(and(eq(commandReceipts.id, id), eq(commandReceipts.status, "received")));
+}
+
+async function createProposal(ownerId: string, sourceReceiptId: string, intent: QqScheduleProposalIntent) {
+  const store = getActiveScheduleStore();
+  const preview = await buildQqProposalPreview(store, intent);
+  const created = await createQqScheduleProposal({ ownerId, sourceReceiptId, intent, preview });
+  const reply = formatQqScheduleProposal(created.proposal.publicId, preview, created.superseded > 0);
+  await updateReceipt(sourceReceiptId, "pending_confirmation", reply, { kind: "schedule_proposal", proposalId: created.proposal.id, publicId: created.proposal.publicId, state: "pending" });
+  return { ...created, reply };
+}
+
+async function sendProposalReply(bot: QQBot, target: ReplyTarget, reply: string, publicId: string, decision: QqScheduleProposalPreview["decision"]) {
+  const proposal = await findQqScheduleProposal(process.env.QQBOT_OWNER_USER_ID!, publicId);
+  if (proposal?.status === "pending" && shouldRenderQqProposalImage(proposal.preview)) {
+    try {
+      const buffer = await renderQqProposalPng(proposal.preview);
+      await bot.sendImage(target, { buffer }, { content: `日程关系预览 · ${publicId}` });
+    } catch (error) {
+      console.warn("[goalset-worker] QQ proposal image unavailable, falling back to text", sanitizedQqError(error));
+    }
+  }
+  if (!qqInlineKeyboardIsEnabled()) {
+    await bot.sendText(target, reply);
+    return;
+  }
+  try {
+    await bot.sendTextWithKeyboard(target, reply, qqProposalKeyboard(publicId, decision));
+  } catch (error) {
+    console.warn("[goalset-worker] QQ inline keyboard unavailable, falling back to text", sanitizedQqError(error));
+    await bot.sendText(target, reply);
+  }
+}
+
+async function sendActionReply(bot: QQBot, ownerId: string, target: ReplyTarget, reply: string) {
+  const active = await findQqScheduleProposal(ownerId);
+  if (active?.status === "pending" && reply.includes(active.publicId)) {
+    await sendProposalReply(bot, target, reply, active.publicId, active.preview.decision);
+    return;
+  }
+  await bot.sendText(target, reply);
+}
+
+function terminalProposalReply(status?: string) {
+  if (!status) return "当前没有待确认的日程提案。";
+  if (status === "superseded") return "这份提案已被更新的提案替代，未执行任何操作。";
+  if (status === "cancelled") return "这份提案已取消，未执行任何操作。";
+  if (status === "applied") return "这份提案已经处理过，不会重复执行。";
+  if (status === "expired") return "这份提案已过期，正在根据最新日程重新生成预览。";
+  return "这份提案当前不能执行，未修改日程。";
+}
+
+async function handleProposalAction(ownerId: string, receiptId: string, action: NonNullable<ReturnType<typeof parseQqProposalAction>>) {
+  if (action.action === "cancel") {
+    const proposal = await cancelQqScheduleProposal(ownerId, action.publicId);
+    if (!proposal || proposal.status !== "cancelled") return terminalProposalReply(proposal?.status);
+    await updateReceipt(proposal.sourceReceiptId, "processed", "提案已取消。", { kind: "schedule_proposal", proposalId: proposal.id, publicId: proposal.publicId, state: "cancelled" });
+    await updateReceipt(receiptId, "processed", "提案已取消。", { kind: "proposal_action", action: "cancel", proposalId: proposal.id });
+    return "已取消该日程提案，没有创建任务或修改日程。";
+  }
+
+  const claimed = await claimQqScheduleProposal(ownerId, action.publicId);
+  const proposal = claimed.proposal;
+  if (!proposal) return terminalProposalReply();
+  if (!claimed.claimed) {
+    if (proposal.status === "expired") {
+      const refreshed = await createProposal(ownerId, receiptId, proposal.intent);
+      return `原提案已过期，未执行。\n\n${refreshed.reply}`;
+    }
+    return terminalProposalReply(proposal.status);
+  }
+
+  const store = getActiveScheduleStore();
+  try {
+    const currentPreview = await buildQqProposalPreview(store, proposal.intent);
+    if (currentPreview.baseFingerprint !== proposal.preview.baseFingerprint) {
+      const refreshed = await createQqScheduleProposal({ ownerId, sourceReceiptId: receiptId, intent: proposal.intent, preview: currentPreview });
+      const reply = `日程已发生变化，旧提案未执行。\n\n${formatQqScheduleProposal(refreshed.proposal.publicId, currentPreview, true)}`;
+      await updateReceipt(receiptId, "pending_confirmation", reply, { kind: "schedule_proposal", proposalId: refreshed.proposal.id, publicId: refreshed.proposal.publicId, state: "pending" });
+      return reply;
+    }
+
+    if (action.action === "save_unplanned") {
+      if (proposal.intent.kind !== "insert" || proposal.preview.decision !== "no_slot") {
+        await releaseQqScheduleProposal(proposal.id, "save_unplanned is not valid for this proposal");
+        return "这份提案不能保存到待安排，未修改日程。";
+      }
+      const result = await store.saveUnplannedTask(proposal.intent.task, { mode: proposal.intent.mode, source: "qq-confirmed-unplanned" });
+      if (!result.changeSetId) throw new Error("QQ_SAVE_UNPLANNED_FAILED");
+      await markQqScheduleProposalApplied(proposal.id, result.changeSetId);
+      await updateReceipt(proposal.sourceReceiptId, "processed", "已保存到待安排。", { kind: "schedule_proposal", proposalId: proposal.id, publicId: proposal.publicId, state: "applied", changeSetId: result.changeSetId });
+      await updateReceipt(receiptId, "processed", "已保存到待安排。", { kind: "proposal_action", action: "save_unplanned", proposalId: proposal.id, changeSetId: result.changeSetId });
+      return `✅ 已保存到待安排\n\n${proposal.preview.taskTitle}\n${proposal.preview.date} · ${proposal.preview.durationMinutes} 分钟\n当前没有创建时间块。`;
+    }
+
+    if (proposal.preview.decision === "no_slot") {
+      await releaseQqScheduleProposal(proposal.id, "confirmation requires save_unplanned or changed constraints");
+      return `当前没有安全空档，不能直接确认安排。请回复“保存到待安排 ${proposal.publicId}”或“取消 ${proposal.publicId}”。`;
+    }
+    const result = proposal.intent.kind === "insert"
+      ? await store.confirmTask(proposal.intent.task, { mode: proposal.intent.mode, source: proposal.intent.mode === "optimize" ? "qq-optimize-confirmed" : "qq-confirmed" })
+      : await store.rescheduleTask(proposal.intent.taskId, proposal.intent.date, proposal.intent.startMinutes, { mode: proposal.intent.mode, confirm: true, source: proposal.intent.mode === "optimize" ? "qq-optimize-confirmed" : "qq-confirmed" });
+    if (!result.changeSetId || result.proposal.decision !== "auto") throw new Error("QQ_PROPOSAL_APPLY_FAILED");
+    await markQqScheduleProposalApplied(proposal.id, result.changeSetId);
+    await updateReceipt(proposal.sourceReceiptId, "processed", "提案已确认并应用。", { kind: "schedule_proposal", proposalId: proposal.id, publicId: proposal.publicId, state: "applied", changeSetId: result.changeSetId });
+    await updateReceipt(receiptId, "processed", "提案已确认并应用。", { kind: "proposal_action", action: "confirm", proposalId: proposal.id, changeSetId: result.changeSetId });
+    const placement = result.proposal.placement;
+    return `✅ 已确认并更新日程\n\n${proposal.preview.taskTitle}${placement ? `\n${placement.date} ${String(Math.floor(placement.startMinutes / 60)).padStart(2, "0")}:${String(placement.startMinutes % 60).padStart(2, "0")}–${String(Math.floor(placement.endMinutes / 60)).padStart(2, "0")}:${String(placement.endMinutes % 60).padStart(2, "0")}` : ""}`;
+  } catch (error) {
+    await releaseQqScheduleProposal(proposal.id, sanitizedQqError(error));
+    throw error;
+  }
 }
 
 if (!reminderChannelIsEnabled("qq")) {
@@ -86,10 +205,33 @@ if (!reminderChannelIsEnabled("qq")) {
       error: (message) => console.error("[qq]", sanitizedQqError(message)),
     },
   });
-  const pendingTasks = new Map<string, PendingCommand>();
-
   bot.on("ready", () => { console.info("[goalset-worker] QQ Bot ready"); void recordWorkerHealth("qq", "running"); });
   bot.on("error", (error) => { const message = sanitizedQqError(error); console.error("[goalset-worker] QQ Bot error", message); void recordWorkerHealth("qq", "error", message); });
+  bot.on("interaction", async (_context, event) => {
+    const senderId = event.user_openid ?? event.data.resolved.user_id;
+    if (!senderId || senderId !== process.env.QQBOT_OWNER_USER_ID) {
+      await bot.acknowledgeInteraction(event.id, 4).catch(() => undefined);
+      return;
+    }
+    const action = parseQqProposalButtonData(event.data.resolved.button_data);
+    if (!action) {
+      await bot.acknowledgeInteraction(event.id, 1).catch(() => undefined);
+      return;
+    }
+    await bot.acknowledgeInteraction(event.id, 0).catch((error) => console.warn("[goalset-worker] QQ interaction ACK failed", sanitizedQqError(error)));
+    const receipt = await claimCommand(event.id, senderId, "qq-interaction");
+    if (!receipt) return;
+    try {
+      const responseText = await handleProposalAction(senderId, receipt.id, action);
+      await sendActionReply(bot, senderId, { scope: "c2c", targetId: senderId }, responseText);
+      await finishReceivedReceipt(receipt.id, responseText, { kind: "proposal_interaction", action: action.action, publicId: action.publicId });
+    } catch (error) {
+      const responseText = "按钮处理失败，原日程没有改变。你仍可使用提案 ID 通过文字确认。";
+      await updateReceipt(receipt.id, "failed", responseText, { kind: "proposal_interaction", action: action.action, publicId: action.publicId });
+      await bot.sendText({ scope: "c2c", targetId: senderId }, responseText).catch(() => undefined);
+      console.error("[goalset-worker] QQ interaction failed", sanitizedQqError(error));
+    }
+  });
   bot.on("message", async (_context, message) => {
     if (message.kind !== "c2c" || message.senderId !== process.env.QQBOT_OWNER_USER_ID) return;
     const receipt = await claimCommand(String(message.messageId), String(message.senderId));
@@ -98,6 +240,7 @@ if (!reminderChannelIsEnabled("qq")) {
     const store = getActiveScheduleStore();
     const text = message.content.trim();
     const controlCommand = parseQqControlCommand(text);
+    const proposalAction = parseQqProposalAction(text);
     const { optimize, commandText } = parseQqCommandMode(text);
 
     try {
@@ -106,23 +249,10 @@ if (!reminderChannelIsEnabled("qq")) {
         await updateReceipt(receipt.id, "processed", controlCommand.reply, { kind: controlCommand.kind });
         return;
       }
-      if (text === "确认") {
-        const pendingRecord = await pendingConfirmation(String(message.senderId));
-        const previousCommand = pendingRecord.command ?? pendingTasks.get(String(message.senderId));
-        if (!previousCommand) {
-          const responseText = "当前没有待确认的日程调整。";
-          await bot.sendText(message.replyTarget, responseText);
-          await updateReceipt(receipt.id, "processed", responseText);
-          return;
-        }
-        const result = previousCommand.kind === "reschedule"
-          ? await store.rescheduleTask(previousCommand.taskId, previousCommand.date, previousCommand.startMinutes, { confirm: true, mode: "optimize", source: "qq-optimize" })
-          : await store.confirmTask(previousCommand.task, { mode: "optimize", source: "qq-optimize" });
-        const responseText = result.proposal.decision === "auto" ? "已确认，日程已调整。" : "确认失败，原日程没有改变。";
-        pendingTasks.delete(String(message.senderId));
-        await bot.sendText(message.replyTarget, responseText);
-        if (pendingRecord.receipt) await updateReceipt(pendingRecord.receipt.id, "processed", responseText);
-        await updateReceipt(receipt.id, "processed", responseText);
+      if (proposalAction) {
+        const responseText = await handleProposalAction(String(message.senderId), receipt.id, proposalAction);
+        await sendActionReply(bot, String(message.senderId), message.replyTarget, responseText);
+        await finishReceivedReceipt(receipt.id, responseText, { kind: "proposal_action", action: proposalAction.action });
         return;
       }
       if (optimize && !commandText) {
@@ -135,22 +265,17 @@ if (!reminderChannelIsEnabled("qq")) {
       const plan = await parseScheduleCommand(commandText, date, snapshot);
       if (plan.operation === "reschedule_task" && plan.targetTaskId && plan.targetStartMinutes !== null && !plan.needsClarification) {
         const targetDate = plan.targetDate ?? date;
-        const result = await store.rescheduleTask(plan.targetTaskId, targetDate, plan.targetStartMinutes, { mode: optimize ? "optimize" : "rules", source: optimize ? "qq-optimize" : "qq" });
-        if (result.proposal.decision === "needs_confirmation") {
-          const command: PendingCommand = { kind: "reschedule", taskId: plan.targetTaskId, date: targetDate, startMinutes: plan.targetStartMinutes, optimize: true };
-          pendingTasks.set(message.senderId, command);
-          const responseText = `${plan.reply}\n需要移动弹性任务，请回复“确认”执行；原日程暂未改变。`;
-          await updateReceipt(receipt.id, "pending_confirmation", responseText, command);
-          await bot.sendText(message.replyTarget, responseText);
-        } else if (result.proposal.decision === "auto") {
-          const responseText = `${plan.reply}\n已完成改期。`;
+        const task = snapshot.tasks.find((item) => item.id === plan.targetTaskId);
+        const block = snapshot.blocks.find((item) => item.taskId === plan.targetTaskId);
+        if (!task || !block) {
+          const responseText = "没有找到可改期的已排期任务，原日程未改变。";
           await bot.sendText(message.replyTarget, responseText);
           await updateReceipt(receipt.id, "processed", responseText);
-        } else {
-          const responseText = result.proposal.reasons.join(" ");
-          await bot.sendText(message.replyTarget, responseText);
-          await updateReceipt(receipt.id, "processed", responseText);
+          return;
         }
+        const intent: QqScheduleProposalIntent = { kind: "reschedule", taskId: plan.targetTaskId, taskTitle: task.title, durationMinutes: task.estimatedMinutes, originDate: task.date, date: targetDate, startMinutes: plan.targetStartMinutes, mode: optimize ? "optimize" : "rules", originalCommand: message.content };
+        const created = await createProposal(String(message.senderId), receipt.id, intent);
+        await sendProposalReply(bot, message.replyTarget, created.reply, created.proposal.publicId, created.proposal.preview.decision);
         return;
       }
       if (plan.needsClarification || !plan.task) {
@@ -178,21 +303,9 @@ if (!reminderChannelIsEnabled("qq")) {
         preferredStartMinutes: plan.task.preferredStartMinutes ?? undefined,
         deadlineMinutes: plan.task.deadlineMinutes ?? undefined,
       };
-      const result = await store.insertTask(task, { mode: optimize ? "optimize" : "rules", source: optimize ? "qq-optimize" : "qq" });
-      if (result.proposal.decision === "needs_confirmation") {
-        pendingTasks.set(message.senderId, { kind: "insert", task, optimize: true });
-        const responseText = `${plan.reply}\n需要移动弹性任务，请回复“确认”执行；原日程暂未改变。`;
-        await updateReceipt(receipt.id, "pending_confirmation", responseText, { kind: "insert", task, optimize: true });
-        await bot.sendText(message.replyTarget, responseText);
-      } else if (result.proposal.decision === "auto") {
-        const responseText = `${plan.reply}\n已安排到 ${result.proposal.placement?.startMinutes} 分钟。`;
-        await bot.sendText(message.replyTarget, responseText);
-        await updateReceipt(receipt.id, "processed", responseText);
-      } else {
-        const responseText = `${plan.reply}\n当前没有安全空档，已保存到待安排，原日程未移动。`;
-        await bot.sendText(message.replyTarget, responseText);
-        await updateReceipt(receipt.id, "processed", responseText);
-      }
+      const intent: QqScheduleProposalIntent = { kind: "insert", task, mode: optimize ? "optimize" : "rules", originalCommand: message.content };
+      const created = await createProposal(String(message.senderId), receipt.id, intent);
+      await sendProposalReply(bot, message.replyTarget, created.reply, created.proposal.publicId, created.proposal.preview.decision);
     } catch (error) {
       console.error("[goalset-worker] command failed", sanitizedQqError(error));
       const responseText = "处理失败，原日程没有改变。";

@@ -8,6 +8,7 @@ web/
 ├── src/components/          # Cross-feature shell and product components
 │   └── ui/                  # Project-owned shadcn/Radix-style primitives
 ├── src/features/<feature>/  # Domain models and feature-specific modules
+│   └── components/          # Feature-owned timeline and on-demand editing surfaces
 ├── src/lib/                 # Shared pure utilities such as cn()
 ├── public/                  # PWA assets and static files
 └── package.json
@@ -17,6 +18,7 @@ web/
 
 - Keep route entrypoints in `src/app` thin; import feature or shell components instead of putting a full domain implementation in `page.tsx`.
 - Put stable domain types next to the feature that owns them (`src/features/schedule/model.ts` currently owns schedule unions and demo data).
+- Put schedule-specific rendering and low-frequency editors in `src/features/schedule/components/`; keep the Dashboard shell/controller in `src/components/` and shared Radix primitives in `src/components/ui/`.
 - Put reusable interaction primitives in `src/components/ui`, not inside a feature folder.
 - Keep provider adapters, database access, and scheduling services out of React components; they will be added as server-side modules when the backend slice begins.
 

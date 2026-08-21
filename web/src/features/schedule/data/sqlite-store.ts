@@ -14,6 +14,7 @@ import { configuredReminderChannels, REMINDER_WORKSPACE_ID } from "@/server/remi
 
 const WORKSPACE_ID = REMINDER_WORKSPACE_ID;
 type ScheduleTransaction = Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0];
+type RecurrenceMaterializationRow = { rule: typeof recurrenceRules.$inferSelect; template: typeof tasks.$inferSelect };
 
 function reminderTime(date: string, startMinutes: number) {
   const [year, month, day] = date.split("-").map(Number);
@@ -180,31 +181,38 @@ export async function seedDate(date: string) {
 }
 
 export class SqliteScheduleStore implements ScheduleStore {
-  private async getRawSnapshot(date: string): Promise<ScheduleSnapshot> {
+  private async getRawSnapshots(dates: string[]): Promise<ScheduleSnapshot[]> {
+    const uniqueDates = [...new Set(dates)];
+    if (uniqueDates.length === 0) return [];
     const db = getDb();
     const [taskRows, blockRows, availabilityRows, unavailableRows, preferenceRows] = await Promise.all([
-      db.select().from(tasks).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.date, date))),
-      db.select().from(scheduleBlocks).where(and(eq(scheduleBlocks.workspaceId, WORKSPACE_ID), eq(scheduleBlocks.date, date))),
-      db.select().from(availabilityRules).where(and(eq(availabilityRules.workspaceId, WORKSPACE_ID), eq(availabilityRules.weekday, weekdayFor(date)), eq(availabilityRules.enabled, true))),
-      db.select().from(unavailableWindows).where(and(eq(unavailableWindows.workspaceId, WORKSPACE_ID), eq(unavailableWindows.date, date))),
+      db.select().from(tasks).where(and(eq(tasks.workspaceId, WORKSPACE_ID), inArray(tasks.date, uniqueDates))),
+      db.select().from(scheduleBlocks).where(and(eq(scheduleBlocks.workspaceId, WORKSPACE_ID), inArray(scheduleBlocks.date, uniqueDates))),
+      db.select().from(availabilityRules).where(and(eq(availabilityRules.workspaceId, WORKSPACE_ID), inArray(availabilityRules.weekday, [...new Set(uniqueDates.map(weekdayFor))]), eq(availabilityRules.enabled, true))),
+      db.select().from(unavailableWindows).where(and(eq(unavailableWindows.workspaceId, WORKSPACE_ID), inArray(unavailableWindows.date, uniqueDates))),
       db.select().from(preferences).where(eq(preferences.workspaceId, WORKSPACE_ID)),
     ]);
     const bufferPreference = preferenceRows.find((row) => row.key === "bufferMinutes")?.value;
     const defaultDurationPreference = preferenceRows.find((row) => row.key === "defaultDurationMinutes")?.value;
-    return {
+    const tasksById = new Map(taskRows.map((task) => [task.id, task]));
+    return uniqueDates.map((date) => ({
       date,
-      tasks: taskRows.map(toTask),
-      blocks: blockRows.map((row) => toBlock(row, taskRows.find((task) => task.id === row.taskId))),
-      availability: availabilityRows.map((row) => ({ date, startMinutes: row.startMinutes, endMinutes: row.endMinutes })),
-      unavailable: unavailableRows.map((row) => ({ date: row.date, startMinutes: row.startMinutes, endMinutes: row.endMinutes, reason: row.reason })),
+      tasks: taskRows.filter((task) => task.date === date).map(toTask),
+      blocks: blockRows.filter((block) => block.date === date).map((row) => toBlock(row, tasksById.get(row.taskId))),
+      availability: availabilityRows.filter((row) => row.weekday === weekdayFor(date)).map((row) => ({ date, startMinutes: row.startMinutes, endMinutes: row.endMinutes })),
+      unavailable: unavailableRows.filter((row) => row.date === date).map((row) => ({ date: row.date, startMinutes: row.startMinutes, endMinutes: row.endMinutes, reason: row.reason })),
       bufferMinutes: typeof bufferPreference === "number" && [0, 15, 30].includes(bufferPreference) ? bufferPreference : 15,
       defaultDurationMinutes: typeof defaultDurationPreference === "number" && [15, 30, 45, 60, 90, 120].includes(defaultDurationPreference) ? defaultDurationPreference : undefined,
-    };
+    }));
   }
 
-  private async materializeRecurrences(date: string) {
+  private async getRawSnapshot(date: string): Promise<ScheduleSnapshot> {
+    const [snapshot] = await this.getRawSnapshots([date]);
+    return snapshot;
+  }
+
+  private async materializeRecurrences(date: string, rules: RecurrenceMaterializationRow[]) {
     const db = getDb();
-    const rules = await db.select({ rule: recurrenceRules, template: tasks }).from(recurrenceRules).innerJoin(tasks, eq(tasks.id, recurrenceRules.taskId)).where(eq(tasks.workspaceId, WORKSPACE_ID));
     for (const { rule, template } of rules) {
       const dates = generateOccurrenceDates({ frequency: rule.frequency, weekdays: rule.weekdays ?? undefined, startDate: rule.startDate, endDate: rule.endDate ?? undefined }, date, date);
       if (!dates.includes(date)) continue;
@@ -267,9 +275,21 @@ export class SqliteScheduleStore implements ScheduleStore {
   }
 
   async getSnapshot(date: string): Promise<ScheduleSnapshot> {
+    const [snapshot] = await this.getSnapshots([date]);
+    return snapshot;
+  }
+
+  async getSnapshots(dates: string[]): Promise<ScheduleSnapshot[]> {
+    const uniqueDates = [...new Set(dates)];
+    if (uniqueDates.length === 0) return [];
     await ensureWorkspace();
-    await this.materializeRecurrences(date);
-    return this.getRawSnapshot(date);
+    const rules = await getDb().select({ rule: recurrenceRules, template: tasks }).from(recurrenceRules).innerJoin(tasks, eq(tasks.id, recurrenceRules.taskId)).where(eq(tasks.workspaceId, WORKSPACE_ID));
+    if (rules.length > 0) {
+      for (const date of uniqueDates) await this.materializeRecurrences(date, rules);
+    }
+    const snapshots = await this.getRawSnapshots(uniqueDates);
+    const byDate = new Map(snapshots.map((snapshot) => [snapshot.date, snapshot]));
+    return dates.map((date) => byDate.get(date)!);
   }
 
   async getUnplannedTasks() {
@@ -278,7 +298,7 @@ export class SqliteScheduleStore implements ScheduleStore {
     return rankUnplannedTasks(rows.map((row) => toTask(row.task)));
   }
 
-  async insertTask(task: ScheduleTask, options: ScheduleMutationOptions = {}) {
+  async previewTask(task: ScheduleTask, options: ScheduleMutationOptions = {}) {
     const current = await this.getSnapshot(task.date);
     const proposal = findScheduleProposal(task, {
       date: current.date,
@@ -288,31 +308,14 @@ export class SqliteScheduleStore implements ScheduleStore {
       bufferMinutes: current.bufferMinutes,
       mode: options.mode ?? "rules",
     });
+    return { proposal, snapshot: current };
+  }
+
+  async insertTask(task: ScheduleTask, options: ScheduleMutationOptions = {}) {
+    const { proposal, snapshot: current } = await this.previewTask(task, options);
     if (proposal.decision !== "auto" || !proposal.placement) {
       if (proposal.decision !== "no_slot") return { proposal, snapshot: current };
-      const changeSetId = randomUUID();
-      const db = getDb();
-      await db.transaction(async (tx) => {
-        await tx.insert(tasks).values({
-          id: task.id,
-          workspaceId: WORKSPACE_ID,
-          projectId: task.projectId,
-          title: task.title,
-          date: task.date,
-          kind: task.kind,
-          status: task.status,
-          priority: task.priority,
-          reminderPolicy: task.reminderPolicy,
-          estimatedMinutes: task.estimatedMinutes,
-          movable: task.movable,
-          preferredStartMinutes: task.preferredStartMinutes,
-          deadlineMinutes: task.deadlineMinutes,
-          notes: task.notes,
-          source: options.source ?? "web",
-        });
-        await tx.insert(changeSets).values({ id: changeSetId, workspaceId: WORKSPACE_ID, source: options.source ?? "web", originalCommand: task.title, parsedIntent: task, beforeState: { operation: "insert_unplanned", date: task.date, taskId: null, moves: [] }, afterState: { operation: "insert_unplanned", date: task.date, taskId: task.id, moves: [] }, status: "applied" });
-      });
-      return { proposal, snapshot: await this.getSnapshot(task.date), changeSetId };
+      return this.saveUnplannedTask(task, options);
     }
     const placement = proposal.placement;
     const changeSetId = randomUUID();
@@ -352,6 +355,33 @@ export class SqliteScheduleStore implements ScheduleStore {
       await tx.insert(changeSets).values({ id: changeSetId, workspaceId: WORKSPACE_ID, source: options.source ?? "web", originalCommand: task.title, parsedIntent: task, beforeState: { date: task.date, taskId: null, moves: [] }, afterState: { date: task.date, taskId: task.id, moves: [] }, status: "applied" });
     });
     return { proposal, snapshot: await this.getSnapshot(task.date), changeSetId };
+  }
+
+  async saveUnplannedTask(task: ScheduleTask, options: ScheduleMutationOptions = {}) {
+    const { proposal } = await this.previewTask(task, options);
+    const changeSetId = randomUUID();
+    const db = getDb();
+    await db.transaction(async (tx) => {
+      await tx.insert(tasks).values({
+        id: task.id,
+        workspaceId: WORKSPACE_ID,
+        projectId: task.projectId,
+        title: task.title,
+        date: task.date,
+        kind: task.kind,
+        status: task.status,
+        priority: task.priority,
+        reminderPolicy: task.reminderPolicy,
+        estimatedMinutes: task.estimatedMinutes,
+        movable: task.movable,
+        preferredStartMinutes: task.preferredStartMinutes,
+        deadlineMinutes: task.deadlineMinutes,
+        notes: task.notes,
+        source: options.source ?? "web",
+      });
+      await tx.insert(changeSets).values({ id: changeSetId, workspaceId: WORKSPACE_ID, source: options.source ?? "web", originalCommand: task.title, parsedIntent: task, beforeState: { operation: "insert_unplanned", date: task.date, taskId: null, moves: [] }, afterState: { operation: "insert_unplanned", date: task.date, taskId: task.id, moves: [] }, status: "applied" });
+    });
+    return { proposal: { ...proposal, decision: "no_slot" as const, placement: undefined, movedBlockIds: [], moves: [] }, snapshot: await this.getSnapshot(task.date), changeSetId };
   }
 
   async confirmTask(task: ScheduleTask, options: ScheduleMutationOptions = {}) {
@@ -540,7 +570,7 @@ export class SqliteScheduleStore implements ScheduleStore {
     return this.getSnapshot(before.date);
   }
 
-  async rescheduleTask(taskId: string, date: string, startMinutes: number, options: RescheduleTaskOptions = {}): Promise<RescheduleTaskResult> {
+  async previewRescheduleTask(taskId: string, date: string, startMinutes: number, options: RescheduleTaskOptions = {}): Promise<RescheduleTaskResult> {
     const db = getDb();
     const [taskRow] = await db.select().from(tasks).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, taskId)));
     if (!taskRow) throw new Error("TASK_NOT_FOUND");
@@ -554,6 +584,23 @@ export class SqliteScheduleStore implements ScheduleStore {
     const probe = { ...task, exactStartMinutes: startMinutes, deadlineMinutes: task.deadlineMinutes === undefined ? targetEnd : Math.min(task.deadlineMinutes, targetEnd) };
     const targetTask = { ...probe, date };
     const proposal = findScheduleProposal(targetTask, { date, availability: current.availability, unavailable: current.unavailable, existing: originDate === date ? current.blocks.filter((item) => item.id !== block.id) : current.blocks, bufferMinutes: current.bufferMinutes, mode: options.mode ?? "rules" });
+    return { taskId, date, startMinutes, proposal, snapshot: current };
+  }
+
+  async rescheduleTask(taskId: string, date: string, startMinutes: number, options: RescheduleTaskOptions = {}): Promise<RescheduleTaskResult> {
+    const db = getDb();
+    const [taskRow] = await db.select().from(tasks).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, taskId)));
+    if (!taskRow) throw new Error("TASK_NOT_FOUND");
+    const task = toTask(taskRow);
+    const originDate = taskRow.date;
+    const current = await this.getSnapshot(date);
+    const originSnapshot = originDate === date ? current : await this.getSnapshot(originDate);
+    const block = originSnapshot.blocks.find((item) => item.taskId === taskId && item.date === originDate);
+    const { proposal } = await this.previewRescheduleTask(taskId, date, startMinutes, options);
+    if (!block) return { taskId, date, startMinutes, proposal, snapshot: current };
+    const targetEnd = startMinutes + task.estimatedMinutes;
+    const probe = { ...task, exactStartMinutes: startMinutes, deadlineMinutes: task.deadlineMinutes === undefined ? targetEnd : Math.min(task.deadlineMinutes, targetEnd) };
+    const targetTask = { ...probe, date };
     if (proposal.decision === "needs_confirmation" && !options.confirm) return { taskId, date, startMinutes, proposal, snapshot: current };
     if ((proposal.decision !== "auto" && !(options.confirm && proposal.decision === "needs_confirmation")) || !proposal.placement) return { taskId, date, startMinutes, proposal, snapshot: current };
     const changeSetId = randomUUID();

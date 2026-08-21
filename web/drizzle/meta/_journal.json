@@ -29,6 +29,20 @@
       "when": 1787288356257,
       "tag": "0003_elite_vapor",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1787294818690,
+      "tag": "0004_dashboard-read-indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1787295506263,
+      "tag": "0005_qq_schedule_proposals",
+      "breakpoints": true
     }
   ]
 }

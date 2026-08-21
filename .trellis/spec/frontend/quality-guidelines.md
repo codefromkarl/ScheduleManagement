@@ -8,6 +8,7 @@ Run from `web/`:
 pnpm lint
 pnpm exec tsc --noEmit
 pnpm build
+pnpm check:bundle
 pnpm test:e2e
 ```
 
@@ -19,6 +20,7 @@ Native drag acceptance must include at least one real pointer `dragTo` path. Syn
 When a control changes durable data, browser smoke should also inspect the returned state: settings must show the saved rule, notification failures must be visible, project filters must retain real project IDs, and recurrence detail must expose its single-occurrence boundary.
 Playwright uses `data/goalset-e2e.db` and port `3100`; the server script recreates that exact test database before migration. Tests must never default to the personal `data/goalset.db` or port `3000`.
 The Playwright web server command must `exec` Next after preparation so Playwright termination reaches the real server process. After every run, assert port `3100` has no listener; a wrapper that leaves `next-server` orphaned is a failing test harness.
+The bundle check runs only after a successful production build. A budget increase requires a before/after production resource measurement and an explanation of which initial capability justifies the added bytes; do not update limits merely to make CI green.
 
 ## Required Patterns
 

@@ -1,4 +1,5 @@
 import {
+  index,
   integer,
   real,
   sqliteTable,
@@ -7,6 +8,7 @@ import {
 } from "drizzle-orm/sqlite-core";
 import type { ReminderImportanceReason } from "@/features/schedule/domain/reminder-policy";
 import { REMINDER_POLICIES } from "../../features/schedule/domain/types";
+import { QQ_SCHEDULE_PROPOSAL_STATUSES, type QqScheduleProposalIntent, type QqScheduleProposalPreview } from "@/server/qq/schedule-proposal-types";
 
 const taskKinds = ["fixed", "flexible", "floating"] as const;
 const taskStatuses = ["todo", "doing", "blocked", "done"] as const;
@@ -60,7 +62,9 @@ export const tasks = sqliteTable("tasks", {
   notes: text("notes"),
   source: text("source").notNull().default("web"),
   ...auditColumns,
-});
+}, (table) => [
+  index("tasks_workspace_date_idx").on(table.workspaceId, table.date),
+]);
 
 export const scheduleBlocks = sqliteTable("schedule_blocks", {
   id: text("id").primaryKey(),
@@ -74,6 +78,7 @@ export const scheduleBlocks = sqliteTable("schedule_blocks", {
   ...auditColumns,
 }, (table) => [
   uniqueIndex("schedule_blocks_task_placement_idx").on(table.taskId, table.date, table.startMinutes),
+  index("schedule_blocks_workspace_date_idx").on(table.workspaceId, table.date),
 ]);
 
 export const availabilityRules = sqliteTable("availability_rules", {
@@ -84,7 +89,9 @@ export const availabilityRules = sqliteTable("availability_rules", {
   endMinutes: integer("end_minutes").notNull(),
   enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
   ...auditColumns,
-});
+}, (table) => [
+  index("availability_rules_workspace_weekday_idx").on(table.workspaceId, table.weekday, table.enabled),
+]);
 
 export const unavailableWindows = sqliteTable("unavailable_windows", {
   id: text("id").primaryKey(),
@@ -94,7 +101,9 @@ export const unavailableWindows = sqliteTable("unavailable_windows", {
   endMinutes: integer("end_minutes").notNull(),
   reason: text("reason").notNull(),
   ...auditColumns,
-});
+}, (table) => [
+  index("unavailable_windows_workspace_date_idx").on(table.workspaceId, table.date),
+]);
 
 export const recurrenceRules = sqliteTable("recurrence_rules", {
   id: text("id").primaryKey(),
@@ -105,7 +114,9 @@ export const recurrenceRules = sqliteTable("recurrence_rules", {
   endDate: text("end_date"),
   timezone: text("timezone").notNull().default("Asia/Shanghai"),
   ...auditColumns,
-});
+}, (table) => [
+  index("recurrence_rules_task_idx").on(table.taskId),
+]);
 
 export const occurrenceOverrides = sqliteTable("occurrence_overrides", {
   id: text("id").primaryKey(),
@@ -116,7 +127,9 @@ export const occurrenceOverrides = sqliteTable("occurrence_overrides", {
   durationMinutes: integer("duration_minutes"),
   note: text("note"),
   ...auditColumns,
-});
+}, (table) => [
+  index("occurrence_overrides_recurrence_date_idx").on(table.recurrenceId, table.occurrenceDate),
+]);
 
 export const preferences = sqliteTable("preferences", {
   id: text("id").primaryKey(),
@@ -140,7 +153,9 @@ export const changeSets = sqliteTable("change_sets", {
   afterState: text("after_state", { mode: "json" }).notNull(),
   status: text("status", { enum: changeSetStatuses }).notNull().default("proposed"),
   ...auditColumns,
-});
+}, (table) => [
+  index("change_sets_workspace_created_idx").on(table.workspaceId, table.createdAt),
+]);
 
 export const reminders = sqliteTable("reminders", {
   id: text("id").primaryKey(),
@@ -159,6 +174,8 @@ export const reminders = sqliteTable("reminders", {
   ...auditColumns,
 }, (table) => [
   uniqueIndex("reminders_dedupe_idx").on(table.workspaceId, table.dedupeKey),
+  index("reminders_delivery_due_idx").on(table.channel, table.status, table.scheduledAt),
+  index("reminders_workspace_created_idx").on(table.workspaceId, table.createdAt),
 ]);
 
 export const channelIdentities = sqliteTable("channel_identities", {
@@ -184,6 +201,28 @@ export const commandReceipts = sqliteTable("command_receipts", {
   ...auditColumns,
 }, (table) => [
   uniqueIndex("command_receipts_external_message_idx").on(table.channel, table.externalMessageId),
+  index("command_receipts_pending_confirmation_idx").on(table.workspaceId, table.channel, table.senderId, table.status, table.createdAt),
+]);
+
+export const qqScheduleProposals = sqliteTable("qq_schedule_proposals", {
+  id: text("id").primaryKey(),
+  publicId: text("public_id").notNull(),
+  workspaceId: text("workspace_id").notNull().references(() => workspaces.id),
+  ownerId: text("owner_id").notNull(),
+  sourceReceiptId: text("source_receipt_id").notNull().references(() => commandReceipts.id),
+  status: text("status", { enum: QQ_SCHEDULE_PROPOSAL_STATUSES }).notNull().default("pending"),
+  activeSlot: text("active_slot"),
+  version: integer("version").notNull().default(1),
+  intent: text("intent", { mode: "json" }).$type<QqScheduleProposalIntent>().notNull(),
+  preview: text("preview", { mode: "json" }).$type<QqScheduleProposalPreview>().notNull(),
+  expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
+  appliedChangeSetId: text("applied_change_set_id").references(() => changeSets.id),
+  lastError: text("last_error"),
+  ...auditColumns,
+}, (table) => [
+  uniqueIndex("qq_schedule_proposals_public_id_idx").on(table.publicId),
+  uniqueIndex("qq_schedule_proposals_active_owner_idx").on(table.workspaceId, table.ownerId, table.activeSlot),
+  index("qq_schedule_proposals_owner_status_idx").on(table.workspaceId, table.ownerId, table.status, table.expiresAt),
 ]);
 
 export const workerHeartbeats = sqliteTable("worker_heartbeats", {

@@ -20,14 +20,18 @@ export type DailyCloseResult = { date: string; targetDate: string; action: Daily
 
 export type ScheduleStore = {
   getSnapshot(date: string): Promise<ScheduleSnapshot>;
+  getSnapshots(dates: string[]): Promise<ScheduleSnapshot[]>;
   getUnplannedTasks(): Promise<ScheduleTask[]>;
+  previewTask(task: ScheduleTask, options?: ScheduleMutationOptions): Promise<InsertTaskResult>;
   insertTask(task: ScheduleTask, options?: ScheduleMutationOptions): Promise<InsertTaskResult>;
+  saveUnplannedTask(task: ScheduleTask, options?: ScheduleMutationOptions): Promise<InsertTaskResult>;
   confirmTask(task: ScheduleTask, options?: ScheduleMutationOptions): Promise<InsertTaskResult>;
   scheduleTask(taskId: string, date: string, options: ScheduleExistingTaskOptions): Promise<ScheduleExistingTaskResult>;
   arrangeUnplanned(date: string): Promise<ArrangeUnplannedResult>;
   closeDay(date: string, action: DailyCloseAction): Promise<DailyCloseResult>;
   undoChangeSet(changeSetId: string): Promise<ScheduleSnapshot>;
   updateTask(taskId: string, changes: Partial<Pick<ScheduleTask, "title" | "status" | "priority" | "reminderPolicy" | "notes">>, audit?: TaskUpdateAudit): Promise<ScheduleSnapshot>;
+  previewRescheduleTask(taskId: string, date: string, startMinutes: number, options?: RescheduleTaskOptions): Promise<RescheduleTaskResult>;
   rescheduleTask(taskId: string, date: string, startMinutes: number, options?: RescheduleTaskOptions): Promise<RescheduleTaskResult>;
   deleteTask(taskId: string): Promise<ScheduleSnapshot>;
 };

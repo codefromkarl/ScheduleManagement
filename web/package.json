@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "check:bundle": "tsx scripts/check-client-bundle.mts",
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
@@ -12,6 +13,7 @@
     "e2e:server": "sh scripts/e2e-server.sh",
     "worker": "tsx src/server/worker.mts",
     "qq:pair": "tsx scripts/qq-pair.mts",
+    "qq:image-smoke": "tsx scripts/qq-proposal-image-smoke.mts",
     "pwa-worker": "tsx src/server/pwa-worker.mts",
     "astrbot:smoke": "tsx scripts/astrbot-gateway-smoke.mts",
     "db:generate": "drizzle-kit generate",
@@ -40,6 +42,7 @@
     "openai": "^7.5.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
+    "sharp": "0.35.3",
     "tailwind-merge": "^3.6.0",
     "tsx": "^4.23.12",
     "web-push": "^3.6.7",

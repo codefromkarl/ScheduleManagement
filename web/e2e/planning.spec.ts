@@ -25,6 +25,11 @@ test("desktop week mode renders a real Monday-to-Sunday timetable without redund
     await createFixed(request, ids[0], "星期表周一任务", monday, 10 * 60);
     await createFixed(request, ids[1], "星期表周日任务", sunday, 16 * 60);
 
+    const coreReads: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (["/api/dashboard", "/api/schedule", "/api/capacity", "/api/tasks/unplanned"].includes(url.pathname)) coreReads.push(url.pathname);
+    });
     await page.clock.install({ time: new Date(`${today}T04:45:00Z`) });
     await page.goto("/");
     const timetable = page.getByLabel("本周星期表");
@@ -43,6 +48,8 @@ test("desktop week mode renders a real Monday-to-Sunday timetable without redund
     expect(await timetable.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(false);
     await expect(page.locator(".timeline-shell")).toHaveCount(0);
     await expect(page.locator(".next-up-card, .summary-strip")).toHaveCount(0);
+    expect([...new Set(coreReads)]).toEqual(["/api/dashboard"]);
+    expect(coreReads.length).toBeLessThanOrEqual(2);
   } finally {
     for (const id of ids.reverse()) await request.delete(`/api/tasks/${id}`);
   }

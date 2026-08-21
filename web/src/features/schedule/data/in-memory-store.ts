@@ -49,6 +49,10 @@ export class InMemoryScheduleStore implements ScheduleStore {
     return cloneSnapshot(snapshot);
   }
 
+  async getSnapshots(dates: string[]) {
+    return Promise.all(dates.map((date) => this.getSnapshot(date)));
+  }
+
   async getUnplannedTasks() {
     const seen = new Set<string>();
     const result: ScheduleTask[] = [];
@@ -63,7 +67,7 @@ export class InMemoryScheduleStore implements ScheduleStore {
     return rankUnplannedTasks(result);
   }
 
-  async insertTask(task: ScheduleTask, options: ScheduleMutationOptions = {}): Promise<InsertTaskResult> {
+  async previewTask(task: ScheduleTask, options: ScheduleMutationOptions = {}): Promise<InsertTaskResult> {
     const current = await this.getSnapshot(task.date);
     const proposal = findScheduleProposal(task, {
       date: current.date,
@@ -73,6 +77,11 @@ export class InMemoryScheduleStore implements ScheduleStore {
       bufferMinutes: current.bufferMinutes,
       mode: options.mode ?? "rules",
     });
+    return { proposal, snapshot: cloneSnapshot(current) };
+  }
+
+  async insertTask(task: ScheduleTask, options: ScheduleMutationOptions = {}): Promise<InsertTaskResult> {
+    const { proposal, snapshot: current } = await this.previewTask(task, options);
 
     if (proposal.decision === "auto" && proposal.placement) {
       current.tasks.push(task);
@@ -84,14 +93,19 @@ export class InMemoryScheduleStore implements ScheduleStore {
     }
 
     if (proposal.decision === "no_slot") {
-      current.tasks.push(task);
-      this.snapshots.set(task.date, current);
-      const changeSetId = randomUUID();
-      this.changes.set(changeSetId, { kind: "insert", date: task.date, taskId: task.id, moves: [] });
-      return { proposal, snapshot: cloneSnapshot(current), changeSetId };
+      return this.saveUnplannedTask(task, options);
     }
 
     return { proposal, snapshot: cloneSnapshot(this.snapshots.get(task.date) ?? current) };
+  }
+
+  async saveUnplannedTask(task: ScheduleTask, options: ScheduleMutationOptions = {}): Promise<InsertTaskResult> {
+    const { proposal, snapshot: current } = await this.previewTask(task, options);
+    current.tasks.push(task);
+    this.snapshots.set(task.date, current);
+    const changeSetId = randomUUID();
+    this.changes.set(changeSetId, { kind: "insert", date: task.date, taskId: task.id, moves: [] });
+    return { proposal: { ...proposal, decision: "no_slot", placement: undefined, movedBlockIds: [], moves: [] }, snapshot: cloneSnapshot(current), changeSetId };
   }
 
   async confirmTask(task: ScheduleTask, options: ScheduleMutationOptions = {}): Promise<InsertTaskResult> {
@@ -201,12 +215,20 @@ export class InMemoryScheduleStore implements ScheduleStore {
     return { date, targetDate, action, affectedTaskIds: taskIds, snapshot: cloneSnapshot(snapshot), changeSetId };
   }
 
-  async rescheduleTask(taskId: string, date: string, startMinutes: number, options: RescheduleTaskOptions = {}): Promise<RescheduleTaskResult> {
+  async previewRescheduleTask(taskId: string, date: string, startMinutes: number, options: RescheduleTaskOptions = {}): Promise<RescheduleTaskResult> {
     const located = this.locateTask(taskId);
     const current = await this.getSnapshot(date);
     if (!located?.block) return { taskId, date, startMinutes, proposal: { decision: "needs_information", movedBlockIds: [], moves: [], reasons: ["任务没有可调整的日程块。"] }, snapshot: current };
     const targetTask = { ...located.task, date, exactStartMinutes: startMinutes, deadlineMinutes: located.task.deadlineMinutes === undefined ? startMinutes + located.task.estimatedMinutes : Math.min(located.task.deadlineMinutes, startMinutes + located.task.estimatedMinutes) };
     const proposal = findScheduleProposal(targetTask, { date, availability: current.availability, unavailable: current.unavailable, existing: located.date === date ? current.blocks.filter((item) => item.id !== located.block!.id) : current.blocks, bufferMinutes: current.bufferMinutes, mode: options.mode ?? "rules" });
+    return { taskId, date, startMinutes, proposal, snapshot: cloneSnapshot(current) };
+  }
+
+  async rescheduleTask(taskId: string, date: string, startMinutes: number, options: RescheduleTaskOptions = {}): Promise<RescheduleTaskResult> {
+    const located = this.locateTask(taskId);
+    const { proposal, snapshot: current } = await this.previewRescheduleTask(taskId, date, startMinutes, options);
+    if (!located?.block) return { taskId, date, startMinutes, proposal, snapshot: current };
+    const targetTask = { ...located.task, date, exactStartMinutes: startMinutes, deadlineMinutes: located.task.deadlineMinutes === undefined ? startMinutes + located.task.estimatedMinutes : Math.min(located.task.deadlineMinutes, startMinutes + located.task.estimatedMinutes) };
     if (proposal.decision === "needs_confirmation" && !options.confirm) return { taskId, date, startMinutes, proposal, snapshot: current };
     if ((proposal.decision !== "auto" && !(options.confirm && proposal.decision === "needs_confirmation")) || !proposal.placement) return { taskId, date, startMinutes, proposal, snapshot: current };
     const fromStartMinutes = located.block.startMinutes;

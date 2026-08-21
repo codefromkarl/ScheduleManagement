@@ -14,6 +14,7 @@ POST /api/schedule/arrange
 POST /api/schedule/daily-close
 GET  /api/tasks/unplanned
 GET  /api/capacity?from=YYYY-MM-DD&to=YYYY-MM-DD
+GET  /api/dashboard?from=YYYY-MM-DD&to=YYYY-MM-DD
 ```
 
 The current implementation is in `web/src/app/api/schedule/route.ts` and `web/src/app/api/tasks/[id]/schedule/route.ts`. The active local deployment uses the SQLite/LibSQL adapter with the in-memory adapter retained only as a no-database development fallback.
@@ -80,6 +81,66 @@ The current implementation is in `web/src/app/api/schedule/route.ts` and `web/sr
 - Each capacity day includes unfinished/scheduled/unplanned/free/slack/deficit minutes, deadline risk count, `healthy | tight | impossible | unknown`, and one deterministic reason. The projection never invokes AI or applies a schedule change.
 
 All payloads are decoded from `unknown` with the shared Zod contract in `src/features/schedule/data/contract.ts`. The client validates the returned snapshot again before using it for display.
+
+## Scenario: Dashboard range projection
+
+### 1. Scope / Trigger
+
+- Use the Dashboard range projection when the day/week workspace needs schedule snapshots, capacity, and cross-date unplanned work for one inclusive calendar range.
+- This boundary prevents the browser from issuing one schedule request per day and prevents capacity from re-reading the same snapshots.
+
+### 2. Signatures
+
+```text
+ScheduleStore.getSnapshots(dates: string[]): Promise<ScheduleSnapshot[]>
+GET /api/dashboard?from=YYYY-MM-DD&to=YYYY-MM-DD
+```
+
+### 3. Contracts
+
+- `from` and `to` are inclusive real calendar keys; the range contains 1–31 days.
+- The response is `{ snapshots, capacityDays, unplannedTasks }` and is validated by `dashboardResponseSchema` on the client.
+- `snapshots` preserve requested date order. `capacityDays` are pure projections of those exact snapshots; the route must not call `getSnapshot()` again per day.
+- SQLite range reads query tasks, blocks, availability, unavailable windows, and preferences in bounded range batches. Single-date callers continue through the same range implementation.
+- A successful schedule mutation invalidates the Dashboard revision, which refreshes the range, project health, and recent changes. Do not use task counts as a substitute for server-state invalidation.
+
+### 4. Validation & Error Matrix
+
+| Condition | HTTP/client behavior |
+| --- | --- |
+| Missing, malformed, reversed, or >31-day range | `400 INVALID_REQUEST` |
+| Storage/materialization failure | `503 DASHBOARD_READ_FAILED`; never return an empty success |
+| Successful payload fails `dashboardResponseSchema` | Show the existing unavailable/demo state; do not partially trust fields |
+| Selected day changes inside the loaded week | Reuse the loaded snapshot; do not refetch the same range |
+| Schedule mutation succeeds | Apply its returned day immediately, then explicitly refresh the range projections |
+
+### 5. Good / Base / Bad Cases
+
+- Good: one production Dashboard request loads seven snapshots, derives seven capacity rows, and includes all-date unplanned tasks.
+- Base: the standalone `/api/schedule`, `/api/capacity`, and `/api/tasks/unplanned` endpoints remain available for focused callers and tests.
+- Bad: the browser loops over seven `/api/schedule` calls, or `/api/capacity` loops over seven `getSnapshot()` calls after the same week was loaded.
+
+### 6. Tests Required
+
+- Unit-test inclusive range keys, reversed/oversized rejection, and the shared response schema.
+- Run the same ordered `getSnapshots()` contract against in-memory and temporary SQLite stores.
+- Playwright must assert that initial core planning reads use only `/api/dashboard`; development Strict Mode may issue it twice, production should issue it once.
+- Production-shaped browser smoke must record API request count and prove mobile day/desktop week behavior is unchanged.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```ts
+const snapshots = await Promise.all(dates.map((date) => fetch(`/api/schedule?date=${date}`)));
+const capacity = await fetch(`/api/capacity?from=${from}&to=${to}`);
+```
+
+#### Correct
+
+```ts
+const response = dashboardResponseSchema.parse(await fetch(`/api/dashboard?from=${from}&to=${to}`).then((item) => item.json()));
+```
 
 ## 4. Validation & Error Matrix
 

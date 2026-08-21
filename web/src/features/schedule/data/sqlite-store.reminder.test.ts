@@ -34,6 +34,19 @@ afterEach(async () => {
 });
 
 describe("SqliteScheduleStore reminder policy persistence", () => {
+  it("returns a requested SQLite date range in one ordered projection", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "goalset-dashboard-range-"));
+    temporaryDirectories.push(directory);
+    const databaseUrl = `file:${join(directory, "goalset.db")}`;
+    process.env.DATABASE_URL = databaseUrl;
+    await migrate(databaseUrl);
+
+    const dates = ["2026-08-23", "2026-08-21", "2026-08-23"];
+    const snapshots = await new SqliteScheduleStore().getSnapshots(dates);
+    expect(snapshots.map((snapshot) => snapshot.date)).toEqual(dates);
+    expect(snapshots.every((snapshot) => snapshot.availability[0]?.date === snapshot.date)).toBe(true);
+  });
+
   it("inherits a recurrence template reminder policy when materializing an occurrence", async () => {
     const directory = await mkdtemp(join(tmpdir(), "goalset-reminder-recurrence-"));
     temporaryDirectories.push(directory);

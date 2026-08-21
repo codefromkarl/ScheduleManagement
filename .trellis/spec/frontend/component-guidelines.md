@@ -60,6 +60,8 @@ type TaskStatus = "todo" | "doing" | "blocked" | "done";
 - The seven weekly snapshots share one range computed from the minimum derived start and maximum derived end. A successful mutation must refresh the week projection even when the selected date does not change; clicking an already selected weekday must not leave the page in a permanent loading state.
 - Weekly task blocks persist only a readable title and explicit `HH:mm–HH:mm` range. Kind stays encoded by the existing border/background tone; the full title, kind, status, project, duration, and time range live in the button's accessible name plus its hover/focus disclosure and task-detail Sheet.
 - Weekly tracks render subtle half-hour lines between the existing hourly lines. The today track renders a labeled `现在 HH:mm` marker; live clock state must use `useSyncExternalStore` with a stable server snapshot so time-dependent text never causes hydration mismatch.
+- Responsive default view uses the request User-Agent as the `useSyncExternalStore` server snapshot: phone/tablet requests render day mode on the server, desktop requests render week mode, and hydration reads the live media query. Do not render a complete desktop workspace on a phone request and replace it after hydration.
+- Initial schedule, capacity, and all-date unplanned state come from the typed `/api/dashboard` range payload. A date switch within the loaded week reuses that snapshot; a mutation explicitly increments the Dashboard revision instead of depending on task-count changes.
 - Drag-over feedback uses the same coordinate-to-minute projection as drop. It shows the exact 15-minute-snapped `HH:mm` target line without mutating local items; only the existing schedule/reschedule API response may move a task or show a conflict marker.
 - Desktop unplanned drag sources live in the compact Dashboard entry outside modal layers. Render at most the three ranked tasks there; the modal Sheet owns the complete list and exact/batch/AI actions, but its rows must not claim draggable behavior while the overlay blocks timeline hit-testing.
 - Both scheduled and unplanned drag payloads carry task ID plus estimated duration. The target renders a neutral start–end ghost with the corresponding height and “release to validate” copy; it must not imply that client preview has passed server constraints.
@@ -97,6 +99,7 @@ type TaskStatus = "todo" | "doing" | "blocked" | "done";
 | The user opens natural-language entry | Focus the command input and expose whether the one-shot AI optimization authorization is off or on. |
 | Mobile viewport is 390px wide | Day mode has no horizontal page overflow; primary icon/calendar controls use approximately 44px hit areas and the day timeline remains the primary schedule surface. |
 | Mobile user selects another date | Fetch the selected calendar key, preserve day mode, and keep previous/next/date-picker/today controls touch accessible. |
+| Mobile request hydrates at 390px | Server and first client render both use day mode; no desktop-to-mobile layout replacement or hydration warning occurs. |
 | Desktop defaults to week mode | Render one shared-time Monday-to-Sunday timetable plus the planning rail; each risk/unplanned summary must lead to the existing Sheet or selected date. |
 | Weekly task receives hover or keyboard focus | Keep title/time visible in the block and expose full title, kind, status, project, duration, and time in the disclosure/accessibility tree. |
 | Current time is inside today's dynamic range | Show one labeled current-time line after hydration; server HTML must not embed a different wall-clock value. |
@@ -152,6 +155,7 @@ type TaskStatus = "todo" | "doing" | "blocked" | "done";
 - For weekly readability, assert persistent block text is title plus start–end time, full metadata is present in `aria-label`/hover-focus disclosure, half-hour guides render, a fixed client clock produces the exact current-time label without hydration errors, and drag-over displays the expected 15-minute target before drop.
 - For unplanned desktop drag, use Playwright's real pointer `dragTo` from the compact chip into another visible date column, assert the Sheet row has no draggable/grip affordance, and verify target-date task/block persistence through the API.
 - Verify the desktop planning rail reuses the typed capacity/unplanned projections, mobile date selection preserves day mode, and task-detail reminder policy survives an API round trip without live QQ credentials.
+- Assert initial core reads use only the typed Dashboard endpoint, production mobile rendering has no layout shift from a desktop default, and a same-week date switch does not refetch the range.
 - For interaction infrastructure, verify outside click, Escape, role/ARIA state, one-layer mutual exclusion, focus entry/return, sidebar 250→76 persistence across reload, mobile navigation capability parity, Sheet background scroll lock, AlertDialog cancellation, and Toast success feedback.
 - For content density, seed scheduled work on multiple dates plus completed, blocked, unplanned, and changed work; assert one add CTA, no next-task or completed/scheduled summary blocks, no full unplanned tray in page flow, no healthy implementation status, and calendar top <= 450px at 390px.
 
@@ -219,3 +223,70 @@ const currentMinutes = useSyncExternalStore(subscribeToClock, getClockSnapshot, 
 ```
 
 The `-1` server snapshot intentionally renders no marker during SSR. Hydration then reads the client clock and subsequent minute ticks update the same projection without mismatched HTML.
+
+## Scenario: Dashboard client boundaries and on-demand surfaces
+
+### 1. Scope / Trigger
+
+- Apply this pattern when adding a low-frequency Dashboard surface, advanced editor, integration panel, or interaction code that is not required to render the initial calendar.
+- The goal is to keep schedule execution visible immediately while preventing settings and advanced workflows from growing the main Dashboard chunk without a budget check.
+
+### 2. Signatures
+
+```tsx
+const ScheduleAddTaskSurface = dynamic(
+  () => import("@/features/schedule/components/schedule-add-task-surface")
+    .then((module) => module.ScheduleAddTaskSurface),
+  { ssr: false },
+);
+
+pnpm build
+pnpm check:bundle
+```
+
+### 3. Contracts
+
+- `schedule-dashboard.tsx` owns server-state coordination, mutation commands, the active-surface union, and the page shell. It does not own the detailed JSX for timeline geometry, add-task forms, or task-detail/recurrence editing.
+- Day/week drag geometry lives in `features/schedule/components/schedule-timeline.tsx`; shared date/time display helpers live in `features/schedule/view-utils.ts`.
+- Low-frequency surfaces use explicit `next/dynamic` imports with `ssr: false` and render only when their `ActiveSurface` value is selected. A closed surface must not mount its Radix portal or execute its child component.
+- Surface components receive typed values and callbacks. They do not fetch, mutate persisted schedule state directly, or recreate scheduling decisions.
+- `scripts/check-client-bundle.mts` reads the production page client manifest after `pnpm build`. The Dashboard entry must remain at or below 140000 gzip bytes and its largest raw entry chunk at or below 430000 bytes until an explicitly measured budget change is approved.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required behavior |
+| --- | --- |
+| `.next` production manifest is absent | `pnpm check:bundle` fails with a run-build-first error |
+| Entry gzip or largest-chunk budget is exceeded | Bundle check fails; split or remove initial code before changing the limit |
+| Dynamic add/settings/detail module is still loading | Preserve the triggering page and focus intent; never mount a second surface |
+| Dynamic surface closes | Clear the matching `ActiveSurface` state and restore focus through the existing Sheet contract |
+| Surface callback mutates schedule data | Route through the parent command handler and consume the validated API snapshot |
+
+### 5. Good / Base / Bad Cases
+
+- Good: the initial calendar loads without task-detail code; clicking a task downloads the detail chunk and preserves recurrence/reminder behavior.
+- Base: always-visible week/day timeline components remain statically imported because every Dashboard visit needs one of them.
+- Bad: importing a new settings SDK or advanced form directly into `schedule-dashboard.tsx`, rendering six closed Sheet trees on every visit, or raising the bundle budget without a production network measurement.
+
+### 6. Tests Required
+
+- Run `pnpm build && pnpm check:bundle` and record raw/gzip entry totals.
+- Playwright must open settings, activity, add-task, and task-detail surfaces after a cold page load; assert focus/close behavior and durable mutation round trips remain intact.
+- Re-run the real-pointer timetable drag test because timeline extraction must not change coordinate or payload behavior.
+- Production-shaped mobile smoke must retain day mode, zero horizontal overflow, stable hydration, and no layout shift caused by dynamic surfaces.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```tsx
+import { AdvancedTaskEditor } from "./advanced-task-editor";
+<Sheet open={false}><AdvancedTaskEditor /></Sheet>
+```
+
+#### Correct
+
+```tsx
+const AdvancedTaskEditor = dynamic(() => import("./advanced-task-editor").then((module) => module.AdvancedTaskEditor), { ssr: false });
+{activeSurface === "task-detail" && <AdvancedTaskEditor {...typedProps} />}
+```

@@ -8,6 +8,12 @@ async function clearDate(store: InMemoryScheduleStore, date: string) {
 }
 
 describe("InMemoryScheduleStore unplanned flow", () => {
+  it("returns range snapshots in the requested order", async () => {
+    const store = new InMemoryScheduleStore();
+    const dates = ["2026-08-22", "2026-08-21", "2026-08-22"];
+    expect((await store.getSnapshots(dates)).map((snapshot) => snapshot.date)).toEqual(dates);
+  });
+
   it("persists a no-slot task without moving existing blocks, then places it at an explicit safe time", async () => {
     const store = new InMemoryScheduleStore();
     const date = "2026-08-21";

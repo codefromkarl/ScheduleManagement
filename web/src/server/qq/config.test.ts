@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pwaIsConfigured, qqIsConfigured, reminderChannelIsEnabled, sanitizedQqError, selectedReminderChannels } from "./config";
+import { pwaIsConfigured, qqInlineKeyboardIsEnabled, qqIsConfigured, reminderChannelIsEnabled, sanitizedQqError, selectedReminderChannels } from "./config";
 
 describe("reminder channel configuration", () => {
   it("keeps both channels enabled when no explicit selection exists", () => {
@@ -16,6 +16,9 @@ describe("reminder channel configuration", () => {
   it("keeps channel selection separate from transport credentials", () => {
     expect(qqIsConfigured({ QQBOT_APP_ID: "app", QQBOT_APP_SECRET: "secret", QQBOT_OWNER_USER_ID: "owner" })).toBe(true);
     expect(pwaIsConfigured({ NEXT_PUBLIC_VAPID_PUBLIC_KEY: "public", VAPID_PRIVATE_KEY: "private", VAPID_SUBJECT: "mailto:owner@example.com" })).toBe(true);
+    expect(qqInlineKeyboardIsEnabled({})).toBe(false);
+    expect(qqInlineKeyboardIsEnabled({ QQBOT_INLINE_KEYBOARD_ENABLED: "true" })).toBe(true);
+    expect(qqInlineKeyboardIsEnabled({ QQBOT_INLINE_KEYBOARD_ENABLED: "1" })).toBe(false);
   });
 
   it("redacts QQ secrets and bounds provider errors", () => {

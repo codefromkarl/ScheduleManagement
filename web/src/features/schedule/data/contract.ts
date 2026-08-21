@@ -60,6 +60,41 @@ export const scheduleSnapshotSchema = z.object({
 
 export const scheduleCommandSchema = z.object({ task: scheduleTaskSchema });
 
+export const scheduleRangeQuerySchema = z.object({ from: scheduleDateSchema, to: scheduleDateSchema }).superRefine((value, context) => {
+  const days = Math.round((Date.parse(`${value.to}T00:00:00Z`) - Date.parse(`${value.from}T00:00:00Z`)) / 86_400_000) + 1;
+  if (days < 1 || days > 31) context.addIssue({ code: "custom", message: "date range must contain 1 to 31 days" });
+});
+
+export function dateKeysInRange(from: string, to: string) {
+  const result: string[] = [];
+  const cursor = new Date(`${from}T00:00:00Z`);
+  const end = new Date(`${to}T00:00:00Z`);
+  while (cursor <= end) {
+    result.push(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return result;
+}
+
+export const dailyCapacitySchema = z.object({
+  date: scheduleDateSchema,
+  status: z.enum(["healthy", "tight", "impossible", "unknown"]),
+  unfinishedMinutes: z.number().int().nonnegative(),
+  scheduledMinutes: z.number().int().nonnegative(),
+  unplannedMinutes: z.number().int().nonnegative(),
+  safeFreeMinutes: z.number().int().nonnegative(),
+  slackMinutes: z.number().int(),
+  deficitMinutes: z.number().int().nonnegative(),
+  deadlineRiskCount: z.number().int().nonnegative(),
+  reason: z.string().min(1),
+});
+
+export const dashboardResponseSchema = z.object({
+  snapshots: z.array(scheduleSnapshotSchema),
+  capacityDays: z.array(dailyCapacitySchema),
+  unplannedTasks: z.array(scheduleTaskSchema),
+});
+
 export const reminderSummarySchema = z.object({
   id: z.string().min(1),
   taskId: z.string().nullable().optional(),
@@ -74,3 +109,4 @@ export const reminderSummarySchema = z.object({
 
 export const reminderListResponseSchema = z.object({ reminders: z.array(reminderSummarySchema) });
 export type ReminderSummary = z.infer<typeof reminderSummarySchema>;
+export type DashboardResponse = z.infer<typeof dashboardResponseSchema>;

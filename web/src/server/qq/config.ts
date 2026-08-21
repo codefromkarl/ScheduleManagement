@@ -18,6 +18,10 @@ export function qqIsConfigured(env: Environment = process.env) {
   return Boolean(env.QQBOT_APP_ID && env.QQBOT_APP_SECRET && env.QQBOT_OWNER_USER_ID);
 }
 
+export function qqInlineKeyboardIsEnabled(env: Environment = process.env) {
+  return env.QQBOT_INLINE_KEYBOARD_ENABLED === "true";
+}
+
 export function qqConfigError() {
   return "QQBOT_APP_ID、QQBOT_APP_SECRET、QQBOT_OWNER_USER_ID must be configured";
 }
