@@ -2,9 +2,9 @@
 
 ## Status
 
-Implementation is in progress. The local Web/PWA flow now covers the core schedule, settings, project, recurrence, reminder, candidate scoring, preference suggestions, and website-AI paths; QQ, cloud AI, private HTTPS, and real push delivery remain external account gates.
+Implementation is in progress. The Web flow now covers the core schedule, settings, project, recurrence, reminder, candidate scoring, preference suggestions, website-AI paths, and authenticated private HTTPS through Cloudflare Tunnel. The current rollout selects QQ as the only reminder/input channel; QQ credentials and real delivery plus cloud AI remain external account gates, while PWA phone acceptance and Tailscale deployment are deferred.
 
-> Current implementation checkpoint: Next.js Web/PWA, shared UI primitives, deterministic scheduling, SQLite/LibSQL migrations and repository, configurable single-user auth bypass, task/project/preference/recurrence APIs, ChangeSet confirmation/undo, structured AI Provider, PWA subscription API, and QQ/PWA worker entrypoints are implemented. The current trusted-LAN deployment uses `AUTH_DISABLED=true` by explicit user request. Real AI/QQ/PWA credentials and external-channel smoke tests remain.
+> Current implementation checkpoint: Next.js Web/PWA, shared UI primitives, deterministic scheduling, SQLite/LibSQL migrations and repository, configurable single-user authentication, task/project/preference/recurrence APIs, ChangeSet confirmation/undo, structured AI Provider, PWA subscription API, and QQ/PWA worker entrypoints are implemented. The current authenticated deployment uses `AUTH_DISABLED=false`; `REMINDER_CHANNELS=qq` selects QQ-only delivery. Real QQ credentials and the owner OpenID are configured; cloud AI plus delayed/human QQ delivery acceptance remain.
 
 > Deployment checkpoint: Docker Compose runs `goalset-app` plus optional QQ/PWA workers against the shared bind-mounted `data/goalset.db`; the app starts by applying SQLite migrations and serving the production build on port 3000. Development fallback remains available only when `DATABASE_URL` is absent.
 
@@ -13,7 +13,7 @@ Implementation is in progress. The local Web/PWA flow now covers the core schedu
 ### 0. Feasibility and project setup
 
 - [ ] Confirm the QQ official Bot application path, C2C private-message intent, sandbox account, credentials, and supported transport.
-- [ ] Decide the private deployment shape: HTTPS endpoint, VPN, or reverse proxy based on the verified QQ transport.
+- [x] Use an authenticated Cloudflare Tunnel at `goalset.codefromkarl.xyz`; keep the Firefly root domain unchanged and retain app-level owner authentication until Cloudflare Access is separately configured.
 - [x] Scaffold the TypeScript Web/PWA application, server runtime, worker entrypoint, database migrations, and environment validation.
 - [x] Replace placeholder Trellis frontend/backend specs with repository-backed conventions after the scaffold exists.
 
@@ -71,8 +71,12 @@ Implementation is in progress. The local Web/PWA flow now covers the core schedu
 
 - [ ] Implement and verify the official C2C transport behind a channel adapter; the official SDK worker entrypoint and owner allowlist are present, but no credentials are available for a real smoke test.
 - [x] Bind one QQ identity, reject unauthorized senders, and persistently deduplicate external message IDs; real transport credentials and sandbox verification remain open.
+- [x] Add and run supervised six-digit owner pairing, refuse implicit rebinding, disable payload-level QQ SDK debug logs, and redact/bound provider errors before persistence or logging.
+- [x] Reserve QQ receipt/help phrases before task parsing and add a bounded delayed QQ test through the normal reminder outbox; near-match task text remains unaffected.
 - [x] Reuse the website command service and return concise schedule results, questions, and confirmations.
 - [ ] Add sandbox integration tests and a real account smoke test without exposing credentials.
+- [x] Run an isolated AstrBot-gateway POC contract for exact UMO outbound envelopes, least-privilege bearer requests, owner rejection, injectable durable duplicate claims, and a fake-gateway runtime smoke without granting AstrBot a second scheduling authority. Real C2C credentials and passive reply remain external acceptance.
+- [ ] Finish QQ-only acceptance: C2C pairing, official API authentication, human-confirmed immediate proactive sends, and one outbox effect across worker restart are proven; only the scheduled reminder beyond the passive-reply window remains.
 
 ### 4.2 Cross-date planning and explainability
 
@@ -94,10 +98,36 @@ Implementation is in progress. The local Web/PWA flow now covers the core schedu
 - [x] Extend isolated Playwright coverage for desktop week default, desktop planning context, mobile today default, mobile date switching, and reminder-policy visibility without requiring live QQ credentials.
 - [x] Add focused domain/store/API tests for auto eligibility, always/never overrides, 09:00 Asia/Shanghai conditional summaries, recurrence inheritance, deduplication, and retry preservation.
 
+### 4.4 True weekly timetable and Dashboard reduction
+
+- [x] Remove the next-task card and completed/scheduled summary strip without removing the compact unplanned/risk entrypoints.
+- [x] Replace the seven-day summary selector plus selected-day timeline with one Monday-through-Sunday timetable on a shared dynamic time range.
+- [x] Preserve task-detail selection and validated 15-minute desktop drag/drop, including cross-day rescheduling; keep mobile day mode and its date navigation unchanged.
+- [x] Extend isolated Playwright coverage to prove multiple dates render concurrently in the weekly timetable and that the removed summary blocks no longer appear.
+
+### 4.5 Weekly schedule readability and interaction feedback
+
+- [x] Render weekly blocks as readable title plus start–end time; retain kind through color/border rather than persistent micro-copy.
+- [x] Expose full title, kind, status, project, and duration through an accessible hover/focus disclosure owned by the domain task block without adding a conflicting dependency.
+- [x] Preserve task-detail click, keyboard activation, drag payloads, cross-day rescheduling, dynamic range, and mobile day-view rendering.
+- [x] Strengthen the current-time cue, half-hour grid, and exact 15-minute drag-target feedback without changing scheduling semantics.
+- [x] Extend isolated Playwright assertions for the reduced block copy, disclosure content/focus behavior, hydration-stable current time, half-hour guides, and snapped drag target.
+
+### 4.6 Drag reachability and adapter parity
+
+- [x] Move the top-ranked desktop unplanned drag sources into the compact Dashboard entry and remove misleading draggable/grip behavior from the modal Sheet.
+- [x] Carry duration in both scheduled and unplanned drag payloads; render a start–end ghost while keeping final legality server-owned.
+- [x] Replace the conflict card overlay with a narrow marker that leaves the blocking task visible and preserves accessible reason text.
+- [x] Make the in-memory adapter support the same cross-date schedule/reschedule lifecycle as SQLite, including origin removal, target insertion, task-date update, and undo.
+- [x] Add real-pointer browser coverage for unplanned placement plus focused adapter tests for cross-date schedule/reschedule/undo; rerun all quality gates.
+
 ### 6. Reminders and background work
 
 - [x] Implement reminder events for task start, affected schedule, and daily risk summary; risk-summary content is intentionally a link back to the Dashboard.
-- [x] Add QQ primary delivery and optional PWA delivery entrypoints with deduplication records, atomic claims, stale-send recovery, and failure states; real channel delivery/retry smoke is open.
+- [x] Add PWA reliable delivery and conditional QQ delivery entrypoints with deduplication records, atomic claims, stale-send recovery, and failure states; real PWA permission/delivery and QQ channel smoke remain open.
+- [x] Add a user-triggered PWA test reminder, per-device push isolation, expired-subscription pruning, provider-acceptance state, service-worker receipt callback, and received-at history. Automated Chrome truthfully reports when the host Push Service refuses registration.
+- [x] Add explicit channel selection, a QQ test outbox endpoint, QQ API-accepted versus client-received copy, and QQ-only settings behavior that ignores leftover PWA credentials.
+- [ ] Deferred by user: complete the human PWA gate only if PWA is explicitly re-enabled later; do not deploy Tailscale for the current QQ-only rollout.
 - [x] Add recurrence materialization and conservative single-occurrence override handling, plus worker heartbeat/last-success diagnostics exposed through `/api/status` and settings.
 
 ### 7. Progress, backup, and operations
@@ -106,6 +136,22 @@ Implementation is in progress. The local Web/PWA flow now covers the core schedu
 - [ ] Implement richer deadline-feasibility scoring beyond the current overdue/blocked/unplanned signals.
 - [x] Add private authentication, secret separation, a consistent SQLite `VACUUM INTO` backup path, an explicitly confirmed temporary-file restore rehearsal, and ChangeSet audit export.
 - [x] Deploy locally with Docker Compose and run browser/API/mobile/worker smoke checks; LAN IP login/API access is verified, while personal-server HTTPS and QQ sandbox checks remain open.
+- [x] Deploy authenticated HTTPS through a dedicated healthy Cloudflare Tunnel, with a pre-deploy SQLite backup, persistent Compose runtime, anonymous redirect/401 checks, authenticated API checks, and real 1440px/390px browser smokes.
+
+### 8. Password owner login
+
+- [x] Keep the existing single-owner password JWT flow and cancel the proposed Google OAuth migration per the latest user instruction.
+- [x] Keep `AUTH_DISABLED=false`, store the user-selected password only in ignored `.env.local`, recreate the production app, and verify wrong-password `401`, correct-login `200`, secure cookie, anonymous API `401`, and authenticated API `200`.
+
+### 9. One-off/recurring creation and AI classification
+
+- [ ] Extract a shared recurrence draft schema and reuse it in recurrence CRUD, schedule creation, AI structured output, and UI response parsing.
+- [ ] Extend the schedule store and create API with an optional recurrence draft; persist task/block or unplanned state, recurrence rule, audit, and reminders atomically while preserving all one-off callers.
+- [ ] Add a visible “一次性 / 周期” choice to the task creation sheet, default to one-off, and expose daily/workday/weekly/selected-weekday plus optional end date only in recurring mode.
+- [ ] Extend deterministic natural-language parsing for explicit Chinese recurrence phrases and extend cloud structured output for recurring/one-off/uncertain decisions.
+- [ ] Return recurrence plans as immutable previews with no database write; add a concrete confirmation UI and post confirmation through the same validated atomic schedule-create contract.
+- [ ] Preserve existing single-occurrence skip/move/override and recurrence materialization behavior; reject unsupported monthly/custom rules and invalid ranges/weekday combinations.
+- [ ] Add domain, store, route, provider, and isolated Playwright coverage for one-off creation, each supported recurrence class, AI preview non-mutation, confirmation, ambiguity clarification, mobile controls, and future instance materialization.
 
 ## Validation Plan
 
@@ -132,8 +178,19 @@ Commands depend on the selected scaffold, but the intended gates are:
 - Passed (2026-08-21 refinement): 33/33 Vitest checks and 3/3 isolated Playwright scenarios pass. Playwright covers rules batch plus whole-batch undo, scheduled drag/click reschedule, rejected-target marker, daily-close confirmation plus undo, and 390px mobile overflow. Production API smoke separately proved batch/daily-close transaction scope and undo, then removed all exact test task/reminder/ChangeSet IDs.
 - Passed: final SQLite `quick_check = ok`, zero foreign-key violations, production build (24 routes), Compose config, healthy app/PWA worker, loopback/LAN HTTP `200`, and invalid batch input `400`.
 - Passed (2026-08-21 responsive planning/reminders): 42/42 Vitest, lint, TypeScript, Drizzle check, two new migrations, isolated migrate/seed, production build (26 static pages/routes), Compose config, and 5/5 Playwright. Real Chrome rendering verified desktop week planning rail and 390px today execution/date navigation against an isolated SQLite database; task reminder policy round-tripped through the API and recurrence materialization inherited its template policy without live QQ credentials.
-- Expected but not passed: real cloud AI (the available `OPENAI_API_KEY` returned HTTP 401), real QQ C2C private message/reply/reminder, and real mobile push permission/delivery. QQ worker exits clearly until its three credentials are provided.
-- Follow-up gaps: cloud AI/QQ/real push credentials, private HTTPS authorization, dedicated project health page, silent AI preference learning beyond the explicit suggestion, daily risk detail beyond the Dashboard link, and randomized property/idempotency tests remain open.
+- Passed (2026-08-21 weekly timetable reduction): 42/42 Vitest, lint, TypeScript, production build (26 static pages/routes), Trellis validation, and 6/6 isolated Playwright. Desktop Chrome rendered Monday-through-Sunday tasks concurrently on one shared dynamic time range, persisted a validated cross-day drag, and omitted the next-task/completed-scheduled summary blocks; 390px mobile day mode remained overflow-free, and port 3100 was released after the run.
+- Passed (2026-08-21 weekly readability): 47/47 Vitest, lint, TypeScript, production build (28 static pages/routes), Trellis validation, and 6/6 isolated Playwright. A fixed 12:45 client clock rendered one hydration-stable current-time label; weekly blocks exposed title plus start–end time and complete focus metadata; half-hour guides and a 13:15 snapped drag preview were visible; existing cross-day persistence, conflict handling, and 390px mobile no-overflow remained green. A 1440px Chrome visual smoke confirmed all seven columns without horizontal overflow, readable task cards, focus disclosure, and exact drag target.
+- Passed (2026-08-21 drag reachability): 54/54 Vitest, lint, TypeScript, production build (29 static pages/routes), Trellis validation, and 7/7 isolated Playwright with QQ credentials explicitly unset to satisfy the current test contract. A real pointer `dragTo` moved a compact unplanned chip into another visible week column and persisted its target task date/block; Sheet rows had no draggable/grip affordance; duration-aware `13:15–13:45` ghost feedback, narrow non-obscuring conflict marker, scheduled same/cross-date persistence, fixed protection, 390px no-overflow, and in-memory cross-date placement/reschedule undo all passed. The first unqualified Playwright run exposed two unrelated QQ-environment assertions (`202` vs expected `409`, configured copy vs unconfigured copy); no QQ code/assertions were changed in this slice.
+- Passed (2026-08-21 private HTTPS): backed up SQLite, restored `AUTH_DISABLED=false`, rotated the development password/secret, built the current production image, kept app/PWA worker healthy, and registered four QUIC Tunnel connections. `https://goalset.codefromkarl.xyz` redirects anonymous users to login; the old password returns `401`; owner login plus root/status/manifest return `200` with a secure HTTP-only session cookie. Real 1440px and 390px Chromium sessions rendered without console errors or horizontal overflow and registered the service worker.
+- Passed (2026-08-21 reliable PWA and AstrBot gateway POC): 47/47 Vitest, lint, TypeScript, Drizzle check, migration 0003, production build (28 generated pages/routes), and 6/6 isolated Playwright. An isolated SQLite one-shot worker preserved an exact push transport failure without mutating tasks; headless and Xvfb Chrome both exposed `Registration failed - permission denied` instead of creating a false subscription. The AstrBot smoke script passed against a local fake `/api/v1/im/bots` plus `/api/v1/im/message` gateway, including exact UMO payload and explicit send opt-in. Real device Push Service and real AstrBot/QQ credentials remain external gates.
+- Deployed locally (2026-08-21): created `backups/pre-pwa-receipt-20260821T133850.db`, verified it and restricted it to `0600`; built fresh App/PWA images; applied migration 0003; and verified healthy App/worker, HTTP/API availability, `quick_check = ok`, zero foreign-key violations, and the live `received_at` column. PWA had zero subscribed devices. Tailscale Serve was never configured and is no longer required for the QQ-only rollout.
+- Passed and deployed (2026-08-21 QQ-only): added explicit `REMINDER_CHANNELS=qq`, QQ test outbox/API/UI, and channel-aware delivery wording; 50/50 Vitest, lint, TypeScript, Drizzle check, production build (29 generated pages/routes), Compose config, and 6/6 isolated Playwright passed. The live App is healthy with authentication enabled, reports `reminderChannels: ["qq"]`, rejects the test truthfully with `QQ_NOT_CONFIGURED`, keeps the PWA worker stopped, and has `quick_check = ok` with zero foreign-key violations. Tailscale Serve status remains empty.
+- Passed and deployed (2026-08-21 password restore): canceled the planned Google migration, kept `AUTH_DISABLED=false`, stored the user-selected password only in ignored `.env.local`, removed the stale default-password copy, and rebuilt the 29-route production app. Public wrong-password/anonymous API requests return `401`; correct login and authenticated API return `200` with a secure HTTP-only cookie. Real 1440px and 390px Chromium logins render the expected schedule without console errors or horizontal overflow; App, QQ worker, and Tunnel remain running.
+- Passed (2026-08-21 commit candidate): 59/59 Vitest, ESLint, TypeScript, Drizzle schema check, 29-route production build, Compose parse, SQLite quick/foreign-key checks, Trellis validation, and a clean 7/7 isolated Playwright rerun with QQ credentials explicitly empty. The first Playwright attempt had one transient 30-second timeout; its cleanup omission caused a cascading 14:00 conflict, while both exact scenarios and the complete rerun passed without code changes.
+- Passed (2026-08-21 real QQ bring-up): a one-time six-digit C2C command discovered and acknowledged the intended owner OpenID; the official token endpoint and WebSocket Gateway connected; a conditional daily-risk summary and two QQ test reminders were accepted by the C2C send API. Recreating and restarting the worker left the sent-test count unchanged (`2 -> 2`), and the rebuilt worker logs lifecycle/HTTP status without message bodies. 55/55 Vitest, lint, TypeScript, Drizzle, Compose, and production build remain green.
+- Human-confirmed (2026-08-21): the QQ client displayed the identity acknowledgement, risk summary, and exactly two intentional test reminders. Two receipt messages had been truthfully persisted with clarification replies and caused zero QQ tasks; the follow-up fix now reserves receipt/help commands before scheduling. A normal-outbox delayed QQ test is pending for 14:38:21 Asia/Shanghai; 59/59 Vitest plus lint, TypeScript, Drizzle, Compose, and the rebuilt production containers are green.
+- Expected but not passed: real cloud AI (the available `OPENAI_API_KEY` returned HTTP 401), user confirmation that the QQ client displayed the immediate messages, and a scheduled reminder beyond the passive-reply window. Real mobile push delivery remains deferred.
+- Follow-up gaps: cloud AI/QQ credentials, optional Cloudflare Access/passwordless identity, optional future PWA re-enable, dedicated project health page, silent AI preference learning beyond the explicit suggestion, daily risk detail beyond the Dashboard link, and randomized property/idempotency tests remain open.
 
 ## Acceptance Scenarios
 
@@ -144,7 +201,7 @@ Commands depend on the selected scaffold, but the intended gates are:
 5. Send a task without a duration; high-confidence defaults are shown for confirmation, while low-confidence input produces one concise clarification question.
 6. Repeat a weekly task, edit one occurrence, and verify the parent recurrence rule remains unchanged.
 7. View the same data in desktop week mode and mobile day mode; status and AI changes remain synchronized.
-8. Receive a QQ reminder and verify PWA notification is optional; a failed reminder does not change task state.
+8. Receive a QQ test reminder and verify short, beyond-reply-window, and worker-restart delivery; a failed reminder does not change task state. PWA remains disabled for this rollout.
 9. Add or complete a project task and verify weighted progress and health explanation update without a hand-entered percentage.
 
 ## Risky Boundaries and Rollback Points

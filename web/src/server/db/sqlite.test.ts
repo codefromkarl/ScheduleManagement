@@ -33,6 +33,7 @@ describe("SQLite persistence", () => {
       const firstDb = drizzle({ client: firstClient, schema });
       const secondDb = drizzle({ client: secondClient, schema });
       const scheduledAt = new Date("2026-08-21T02:00:00.000Z");
+      const receivedAt = new Date("2026-08-21T02:00:01.000Z");
 
       await firstDb.insert(schema.workspaces).values({ id: "personal", name: "个人工作区" });
       await firstDb.insert(schema.preferences).values({ id: "preference", workspaceId: "personal", key: "bufferMinutes", value: 15 });
@@ -45,6 +46,7 @@ describe("SQLite persistence", () => {
         scheduledAt,
         dedupeKey: "daily-summary:test:pwa",
         importanceReasons: ["blocked_task", "impossible_capacity"],
+        receivedAt,
       });
 
       const [preference] = await firstDb.select().from(schema.preferences);
@@ -54,6 +56,7 @@ describe("SQLite persistence", () => {
       expect(task.reminderPolicy).toBe("auto");
       expect(reminder.scheduledAt).toEqual(scheduledAt);
       expect(reminder.importanceReasons).toEqual(["blocked_task", "impossible_capacity"]);
+      expect(reminder.receivedAt).toEqual(receivedAt);
 
       const claim = (database: typeof firstDb) => database
         .update(schema.reminders)

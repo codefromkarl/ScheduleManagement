@@ -1,16 +1,20 @@
 import { config } from "dotenv";
 config({ path: ".env.local" });
 import webpush from "web-push";
-import { and, eq, lte, lt } from "drizzle-orm";
+import { and, eq, inArray, lte, lt } from "drizzle-orm";
 import { getDb } from "@/server/db";
 import { getActiveScheduleStore } from "@/features/schedule/data/active-store";
 import { evaluateDailySummary } from "@/features/schedule/domain/reminder-policy";
 import { pushSubscriptions, reminders } from "@/server/db/schema";
-import { pwaIsConfigured } from "@/server/qq/config";
+import { pwaIsConfigured, reminderChannelIsEnabled } from "@/server/qq/config";
 import { dailySummaryTime, reminderMessage, REMINDER_WORKSPACE_ID, todayInShanghai } from "@/server/reminders";
 import { recordWorkerHealth } from "@/server/worker-health";
+import { deliverPwaPayload } from "@/server/pwa-delivery";
 
-if (!pwaIsConfigured()) {
+if (!reminderChannelIsEnabled("pwa")) {
+  console.error("[goalset-pwa-worker] PWA reminder channel is disabled by REMINDER_CHANNELS");
+  process.exitCode = 1;
+} else if (!pwaIsConfigured()) {
   console.error("[goalset-pwa-worker] NEXT_PUBLIC_VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY and VAPID_SUBJECT must be configured");
   process.exitCode = 1;
 } else {
@@ -40,11 +44,14 @@ if (!pwaIsConfigured()) {
           await db.update(reminders).set({ status: "failed", error: "No PWA subscriptions", updatedAt: new Date() }).where(eq(reminders.id, reminder.id));
           continue;
         }
-        try {
-          await Promise.all(subscriptions.map((subscription) => webpush.sendNotification({ endpoint: subscription.endpoint, keys: { p256dh: subscription.p256dh, auth: subscription.auth } }, JSON.stringify({ title: "goalset 提醒", body: reminderMessage(reminder.kind, reminder.taskId, reminder.importanceReasons ?? []), url: "/" }))));
-          await db.update(reminders).set({ status: "sent", sentAt: new Date(), updatedAt: new Date() }).where(eq(reminders.id, reminder.id));
-        } catch (error) {
-          await db.update(reminders).set({ status: "failed", error: error instanceof Error ? error.message : "unknown error", updatedAt: new Date() }).where(eq(reminders.id, reminder.id));
+        const payload = JSON.stringify({ reminderId: reminder.id, title: "goalset 提醒", body: reminderMessage(reminder.kind, reminder.taskId, reminder.importanceReasons ?? [], "pwa"), url: "/" });
+        const delivery = await deliverPwaPayload(subscriptions, payload, (subscription, body) => webpush.sendNotification(subscription, body));
+        if (delivery.staleIds.length > 0) await db.delete(pushSubscriptions).where(inArray(pushSubscriptions.id, delivery.staleIds));
+        if (delivery.acceptedIds.length > 0) {
+          await db.update(reminders).set({ status: "sent", sentAt: new Date(), error: null, updatedAt: new Date() }).where(eq(reminders.id, reminder.id));
+        } else {
+          const error = delivery.errors.length > 0 ? delivery.errors.join("; ").slice(0, 1000) : "No active PWA subscriptions";
+          await db.update(reminders).set({ status: "failed", error, updatedAt: new Date() }).where(eq(reminders.id, reminder.id));
         }
       }
       await recordWorkerHealth("pwa", "success").catch(() => undefined);
@@ -54,9 +61,13 @@ if (!pwaIsConfigured()) {
     }
   }
 
-  void dispatch();
-  const timer = setInterval(() => { void dispatch(); }, 30_000);
-  const stop = () => { clearInterval(timer); process.exit(0); };
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
+  if (process.env.PWA_WORKER_ONCE === "true") {
+    void dispatch().then(() => process.exit(0), () => process.exit(1));
+  } else {
+    void dispatch();
+    const timer = setInterval(() => { void dispatch(); }, 30_000);
+    const stop = () => { clearInterval(timer); process.exit(0); };
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  }
 }

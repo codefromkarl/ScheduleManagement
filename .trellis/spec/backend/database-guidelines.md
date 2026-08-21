@@ -35,9 +35,10 @@ pnpm db:import-postgres <snapshot.json>
 - Store timestamps as integer epoch milliseconds using Drizzle `timestamp_ms`, booleans as SQLite integers with boolean mapping, and structured values as JSON text columns.
 - Use transactions for a schedule mutation plus its block, ChangeSet, and reminder records. SQLite has one writer, so transactions must stay short and must not include provider/network calls.
 - Use explicit workspace filters on every user-owned query. Keep task identity separate from schedule placement identity.
-- `db:backup` uses SQLite `VACUUM INTO` and verifies the result with `PRAGMA quick_check`. Restore requires stopped app/workers and the explicit confirmation variable.
+- `db:backup` uses SQLite `VACUUM INTO`, immediately restricts the output to mode `0600`, and verifies the result with `PRAGMA quick_check`. Restore requires stopped app/workers and the explicit confirmation variable.
 - `db:seed` is the only command allowed to create demo tasks. API reads must never seed or mutate demo data.
 - Reminder dispatch claims `pending` rows with an atomic conditional update; duplicate QQ input is guarded by the unique `(channel, externalMessageId)` receipt index.
+- The no-database in-memory store is a development fallback, not a reduced domain implementation. Its cross-date schedule/reschedule/undo projections must match SQLite even though persistence mechanics differ.
 
 ### 4. Validation & Error Matrix
 
@@ -52,6 +53,7 @@ pnpm db:import-postgres <snapshot.json>
 | Duplicate reminder or QQ message | Unique indexes and atomic claims prevent a second effect. |
 | PostgreSQL snapshot contains ISO timestamps in date columns | Import exactly the first ten `YYYY-MM-DD` characters. |
 | Backup integrity failure | Fail `db:backup`; do not report the file as usable. |
+| Backup file is group/world-readable | Restrict it to `0600`; private task data must not inherit a permissive umask. |
 | Restore without explicit confirmation | Refuse before replacing the live file. |
 | Foreign-key violation | Fail the transaction/import and require `PRAGMA foreign_key_check` to return zero rows. |
 
@@ -67,6 +69,7 @@ pnpm db:import-postgres <snapshot.json>
 - The SQLite integration test must assert JSON/timestamp round trips, exactly one winner for two concurrent reminder claims, `quick_check = ok`, and zero foreign-key violations.
 - A migration/import rehearsal must compare all 15 PostgreSQL table counts with SQLite and then verify an API date query returns the imported tasks/blocks.
 - A backup/restore rehearsal must restore into a temporary file, pass `quick_check`, and preserve the task count.
+- Focused adapter tests must compare cross-date placement/reschedule origin removal, target insertion, task-date updates, and undo restoration for the in-memory fallback; SQLite API/browser tests cover the durable equivalent.
 - Compose acceptance must prove the app is healthy, the PWA worker can write its heartbeat through the shared file, and `/api/status` plus `/api/schedule` return real SQLite data.
 
 ### 7. Wrong vs Correct

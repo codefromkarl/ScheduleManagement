@@ -14,7 +14,7 @@ const taskPriorities = ["low", "normal", "high"] as const;
 const recurrenceFrequencies = ["daily", "weekly", "workday", "weekdays"] as const;
 const occurrenceActions = ["skip", "move", "override"] as const;
 const changeSetStatuses = ["proposed", "applied", "undone", "rejected"] as const;
-const reminderKinds = ["start", "schedule_change", "daily_summary"] as const;
+const reminderKinds = ["start", "schedule_change", "daily_summary", "test"] as const;
 const reminderChannels = ["qq", "pwa"] as const;
 const reminderStatuses = ["pending", "sending", "sent", "failed", "cancelled"] as const;
 const commandReceiptStatuses = ["received", "pending_confirmation", "processed", "failed"] as const;
@@ -154,6 +154,7 @@ export const reminders = sqliteTable("reminders", {
   dedupeKey: text("dedupe_key").notNull(),
   importanceReasons: text("importance_reasons", { mode: "json" }).$type<ReminderImportanceReason[]>(),
   sentAt: integer("sent_at", { mode: "timestamp_ms" }),
+  receivedAt: integer("received_at", { mode: "timestamp_ms" }),
   error: text("error"),
   ...auditColumns,
 }, (table) => [

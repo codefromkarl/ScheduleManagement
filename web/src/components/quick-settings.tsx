@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-import { Check, Clock3, Plus, Trash2, X } from "lucide-react";
+import { BellRing, Check, Clock3, Plus, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -32,15 +32,20 @@ function defaultRules(): WeeklyRule[] {
 type QuickSettingsProps = {
   bufferMinutes: number;
   onBufferChange: (minutes: number) => Promise<void>;
+  onQqTest: () => Promise<void>;
   onPwaEnable: () => Promise<void>;
+  onPwaTest: () => Promise<void>;
   onNotify: (message: string) => void;
   onClose: () => void;
   showHeader?: boolean;
   workers?: WorkerHealth[];
   qqConfigured?: boolean;
+  pwaConfigured?: boolean;
+  pwaSubscriptionCount?: number;
+  reminderChannels?: Array<"qq" | "pwa">;
 };
 
-export function QuickSettings({ bufferMinutes, onBufferChange, onPwaEnable, onNotify, onClose, showHeader = true, workers = [], qqConfigured = false }: QuickSettingsProps) {
+export function QuickSettings({ bufferMinutes, onBufferChange, onQqTest, onPwaEnable, onPwaTest, onNotify, onClose, showHeader = true, workers = [], qqConfigured = false, pwaConfigured = false, pwaSubscriptionCount = 0, reminderChannels = ["qq", "pwa"] }: QuickSettingsProps) {
   const [rules, setRules] = useState<WeeklyRule[]>(defaultRules);
   const [unavailable, setUnavailable] = useState<UnavailableWindow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -48,9 +53,14 @@ export function QuickSettings({ bufferMinutes, onBufferChange, onPwaEnable, onNo
   const [error, setError] = useState("");
   const [defaultDuration, setDefaultDuration] = useState<number | null>(null);
   const [durationSuggestion, setDurationSuggestion] = useState<{ value: number; sampleCount: number; message: string } | null>(null);
+  const [testingQq, setTestingQq] = useState(false);
+  const [testingPwa, setTestingPwa] = useState(false);
   const [unavailableForm, setUnavailableForm] = useState({ date: todayDateKey(), startMinutes: 720, endMinutes: 780, reason: "午休" });
 
   const orderedRules = useMemo(() => displayWeekdays.map((weekday) => rules.find((rule) => rule.weekday === weekday) ?? { weekday, startMinutes: 540, endMinutes: 1080, enabled: true }), [rules]);
+  const qqSelected = reminderChannels.includes("qq");
+  const pwaSelected = reminderChannels.includes("pwa");
+  const selectedWorkers = workers.filter((worker) => reminderChannels.includes(worker.workerName as "qq" | "pwa"));
 
   useEffect(() => {
     fetch("/api/availability", { cache: "no-store" })
@@ -132,6 +142,24 @@ export function QuickSettings({ bufferMinutes, onBufferChange, onPwaEnable, onNo
     onNotify("临时不可用时间已删除");
   }
 
+  async function testPwa() {
+    setTestingPwa(true);
+    try {
+      await onPwaTest();
+    } finally {
+      setTestingPwa(false);
+    }
+  }
+
+  async function testQq() {
+    setTestingQq(true);
+    try {
+      await onQqTest();
+    } finally {
+      setTestingQq(false);
+    }
+  }
+
   return (
     <section className="quick-settings" aria-label="快速设置">
       {showHeader && <div className="quick-settings__header">
@@ -171,7 +199,7 @@ export function QuickSettings({ bufferMinutes, onBufferChange, onPwaEnable, onNo
           </form>
           {unavailable.length > 0 && <div className="unavailable-list">{unavailable.map((item) => <div className="unavailable-row" key={item.id}><span>{item.date} · {minutesToTime(item.startMinutes)}–{minutesToTime(item.endMinutes)} · {item.reason}</span><Button variant="ghost" size="icon" type="button" aria-label={`删除 ${item.reason}`} onClick={() => void removeUnavailable(item.id)}><Trash2 size={13} /></Button></div>)}</div>}
         </div>
-        <details className="settings-advanced"><summary>提醒与集成状态</summary><div className="settings-advanced__content"><div><div className="worker-health"><span>后台提醒状态</span>{workers.length === 0 ? <strong>尚未运行</strong> : workers.map((worker) => <span key={worker.workerName} className={`worker-health__item worker-health__item--${worker.status}`}><i />{worker.workerName.toUpperCase()} {worker.status === "success" ? "正常" : worker.status === "error" ? "异常" : worker.status}</span>)}{!qqConfigured && <span className="worker-health__item worker-health__item--muted"><i />QQ 未配置</span>}</div><p className="reminder-policy-summary"><strong>QQ 重要提醒</strong><span>高优先级任务与固定安排提前 15 分钟；重要改期即时提醒；每日 09:00 仅在有逾期、阻塞或容量风险时发送摘要。单任务可在详情中设为强制提醒或不提醒。</span></p></div><Button variant="outline" size="sm" type="button" onClick={() => void onPwaEnable()}><Clock3 size={13} /> 开启 PWA 提醒</Button></div></details>
+        <details className="settings-advanced"><summary>提醒与集成状态</summary><div className="settings-advanced__content"><div><div className="worker-health"><span>后台提醒状态</span>{selectedWorkers.length === 0 ? <strong>尚未运行</strong> : selectedWorkers.map((worker) => <span key={worker.workerName} className={`worker-health__item worker-health__item--${worker.status}`}><i />{worker.workerName.toUpperCase()} {worker.status === "success" ? "正常" : worker.status === "error" ? "异常" : worker.status}</span>)}{qqSelected && !qqConfigured && <span className="worker-health__item worker-health__item--muted"><i />QQ 凭据未配置</span>}{pwaSelected && !pwaConfigured && <span className="worker-health__item worker-health__item--muted"><i />PWA 凭据未配置</span>}</div>{qqSelected && <p className="reminder-policy-summary"><strong>QQ {pwaSelected ? "提醒与突发任务通道" : "唯一提醒通道"}</strong><span>{qqConfigured ? "重要任务、固定安排和每日 09:00 实际风险会发送到绑定 QQ；突发任务仍调用 Goalset 的同一套排程规则。真实客户端收到、超回复窗口和 worker 重启仍需分别验收。" : "当前已选择仅通过 QQ 提醒，但凭据尚未配置；在配置并启动 QQ worker 前不会发送提醒。"}</span></p>}{pwaSelected && <p className="reminder-policy-summary"><strong>PWA 提醒 · {pwaSubscriptionCount} 台设备</strong><span>测试提醒只有在推送服务接受且设备服务工作线程回执后才算成功。</span></p>}</div><div className="reminder-channel-actions">{qqSelected && <Button variant="soft" size="sm" type="button" disabled={!qqConfigured || testingQq} onClick={() => void testQq()}><BellRing size={13} />{testingQq ? "等待 QQ 发送…" : "发送 QQ 测试提醒"}</Button>}{pwaSelected && <><Button variant="outline" size="sm" type="button" onClick={() => void onPwaEnable()}><Clock3 size={13} /> 开启 PWA 提醒</Button><Button variant="soft" size="sm" type="button" disabled={!pwaConfigured || pwaSubscriptionCount === 0 || testingPwa} onClick={() => void testPwa()}><BellRing size={13} />{testingPwa ? "等待回执…" : "发送 PWA 测试提醒"}</Button></>}</div></div></details>
         {error && <p className="settings-error" role="alert">{error}</p>}
       </div>
     </section>

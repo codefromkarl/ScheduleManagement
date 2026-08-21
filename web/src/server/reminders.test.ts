@@ -10,5 +10,7 @@ describe("reminder presentation and time policy", () => {
     expect(reminderReasonText(["high_priority", "fixed_schedule"])).toBe("高优先级任务、固定安排");
     expect(reminderMessage("daily_summary", null, ["blocked_task", "impossible_capacity"]))
       .toContain("阻塞任务、容量不可行");
+    expect(reminderMessage("test", null, [], "qq")).toContain("QQ 测试提醒");
+    expect(reminderMessage("test", null, [], "pwa")).toContain("Web Push");
   });
 });

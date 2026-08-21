@@ -35,6 +35,14 @@ export class InMemoryScheduleStore implements ScheduleStore {
   private readonly snapshots = new Map<string, ScheduleSnapshot>();
   private readonly changes = new Map<string, InMemoryChange>();
 
+  private locateTask(taskId: string) {
+    for (const [date, snapshot] of this.snapshots.entries()) {
+      const task = snapshot.tasks.find((item) => item.id === taskId && item.date === date);
+      if (task) return { date, snapshot, task, block: snapshot.blocks.find((item) => item.taskId === taskId && item.date === date) };
+    }
+    return null;
+  }
+
   async getSnapshot(date: string) {
     const snapshot = this.snapshots.get(date) ?? createDemoSnapshot(date);
     this.snapshots.set(date, snapshot);
@@ -112,18 +120,18 @@ export class InMemoryScheduleStore implements ScheduleStore {
   }
 
   async scheduleTask(taskId: string, date: string, options: ScheduleExistingTaskOptions): Promise<ScheduleExistingTaskResult> {
+    const located = this.locateTask(taskId);
     const current = await this.getSnapshot(date);
-    const task = current.tasks.find((item) => item.id === taskId);
-    if (!task) return { taskId, date, proposal: { decision: "needs_information", movedBlockIds: [], moves: [], reasons: ["任务不存在或不属于当前日期。"] }, snapshot: current };
-    if (current.blocks.some((item) => item.taskId === taskId)) {
+    if (!located) return { taskId, date, proposal: { decision: "needs_information", movedBlockIds: [], moves: [], reasons: ["任务不存在。"] }, snapshot: current };
+    if (located.block) {
       return { taskId, date, proposal: { decision: "needs_information", movedBlockIds: [], moves: [], reasons: ["任务已经排入日程，请使用改期操作。"] }, snapshot: current };
     }
-    const targetEnd = options.startMinutes === undefined ? undefined : options.startMinutes + task.estimatedMinutes;
+    const targetEnd = options.startMinutes === undefined ? undefined : options.startMinutes + located.task.estimatedMinutes;
     const probe = {
-      ...task,
+      ...located.task,
       date,
       exactStartMinutes: options.startMinutes,
-      deadlineMinutes: targetEnd === undefined ? task.deadlineMinutes : task.deadlineMinutes === undefined ? targetEnd : Math.min(task.deadlineMinutes, targetEnd),
+      deadlineMinutes: targetEnd === undefined ? located.task.deadlineMinutes : located.task.deadlineMinutes === undefined ? targetEnd : Math.min(located.task.deadlineMinutes, targetEnd),
     };
     const proposal = findScheduleProposal(probe, { date, availability: current.availability, unavailable: current.unavailable, existing: current.blocks, bufferMinutes: current.bufferMinutes, mode: options.mode ?? "rules" });
     if (proposal.decision === "needs_confirmation" && !options.confirm) return { taskId, date, proposal, snapshot: current };
@@ -133,10 +141,16 @@ export class InMemoryScheduleStore implements ScheduleStore {
       if (movedBlock) movedBlock.startMinutes = move.toStartMinutes;
     }
     const block = placementToBlock(probe, proposal.placement);
+    if (located.date !== date) {
+      located.snapshot.tasks = located.snapshot.tasks.filter((item) => item.id !== taskId);
+      current.tasks = current.tasks.filter((item) => item.id !== taskId);
+      current.tasks.push({ ...located.task, date });
+      this.snapshots.set(located.date, located.snapshot);
+    }
     current.blocks.push(block);
     this.snapshots.set(date, current);
     const changeSetId = randomUUID();
-    this.changes.set(changeSetId, { kind: "place", date, taskId, blockId: block.id, moves: proposal.moves.map((move) => ({ blockId: move.blockId, fromStartMinutes: move.fromStartMinutes })) });
+    this.changes.set(changeSetId, { kind: "place", date: located.date, targetDate: date, taskId, blockId: block.id, moves: proposal.moves.map((move) => ({ blockId: move.blockId, fromStartMinutes: move.fromStartMinutes })) });
     return { taskId, date, proposal: { ...proposal, decision: "auto" }, snapshot: cloneSnapshot(current), changeSetId };
   }
 
@@ -188,22 +202,33 @@ export class InMemoryScheduleStore implements ScheduleStore {
   }
 
   async rescheduleTask(taskId: string, date: string, startMinutes: number, options: RescheduleTaskOptions = {}): Promise<RescheduleTaskResult> {
+    const located = this.locateTask(taskId);
     const current = await this.getSnapshot(date);
-    const task = current.tasks.find((item) => item.id === taskId);
-    const block = current.blocks.find((item) => item.taskId === taskId && item.date === date);
-    if (!task || !block) return { taskId, date, startMinutes, proposal: { decision: "needs_information", movedBlockIds: [], moves: [], reasons: ["任务没有可调整的日程块。"] }, snapshot: current };
-    const probe = { ...task, exactStartMinutes: startMinutes, deadlineMinutes: task.deadlineMinutes === undefined ? startMinutes + task.estimatedMinutes : Math.min(task.deadlineMinutes, startMinutes + task.estimatedMinutes) };
-    const proposal = findScheduleProposal(probe, { date, availability: current.availability, unavailable: current.unavailable, existing: current.blocks.filter((item) => item.id !== block.id), bufferMinutes: current.bufferMinutes, mode: options.mode ?? "rules" });
+    if (!located?.block) return { taskId, date, startMinutes, proposal: { decision: "needs_information", movedBlockIds: [], moves: [], reasons: ["任务没有可调整的日程块。"] }, snapshot: current };
+    const targetTask = { ...located.task, date, exactStartMinutes: startMinutes, deadlineMinutes: located.task.deadlineMinutes === undefined ? startMinutes + located.task.estimatedMinutes : Math.min(located.task.deadlineMinutes, startMinutes + located.task.estimatedMinutes) };
+    const proposal = findScheduleProposal(targetTask, { date, availability: current.availability, unavailable: current.unavailable, existing: located.date === date ? current.blocks.filter((item) => item.id !== located.block!.id) : current.blocks, bufferMinutes: current.bufferMinutes, mode: options.mode ?? "rules" });
     if (proposal.decision === "needs_confirmation" && !options.confirm) return { taskId, date, startMinutes, proposal, snapshot: current };
     if ((proposal.decision !== "auto" && !(options.confirm && proposal.decision === "needs_confirmation")) || !proposal.placement) return { taskId, date, startMinutes, proposal, snapshot: current };
-    const fromStartMinutes = block.startMinutes;
+    const fromStartMinutes = located.block.startMinutes;
     for (const move of proposal.moves) {
       const movedBlock = current.blocks.find((item) => item.id === move.blockId);
       if (movedBlock) movedBlock.startMinutes = move.toStartMinutes;
     }
-    block.startMinutes = proposal.placement.startMinutes;
+    if (located.date === date) {
+      const currentBlock = current.blocks.find((item) => item.id === located.block!.id);
+      if (currentBlock) currentBlock.startMinutes = proposal.placement.startMinutes;
+    } else {
+      const targetBlock = placementToBlock(targetTask, proposal.placement);
+      located.snapshot.tasks = located.snapshot.tasks.filter((item) => item.id !== taskId);
+      located.snapshot.blocks = located.snapshot.blocks.filter((item) => item.id !== located.block!.id);
+      current.tasks = current.tasks.filter((item) => item.id !== taskId);
+      current.blocks = current.blocks.filter((item) => item.taskId !== taskId);
+      current.tasks.push({ ...located.task, date });
+      current.blocks.push(targetBlock);
+      this.snapshots.set(located.date, located.snapshot);
+    }
     const changeSetId = randomUUID();
-    this.changes.set(changeSetId, { kind: "reschedule", date, taskId, blockId: block.id, fromStartMinutes, moves: proposal.moves.map((move) => ({ blockId: move.blockId, fromStartMinutes: move.fromStartMinutes })) });
+    this.changes.set(changeSetId, { kind: "reschedule", date: located.date, targetDate: date, taskId, blockId: located.block.id, blocks: [structuredClone(located.block)], fromStartMinutes, moves: proposal.moves.map((move) => ({ blockId: move.blockId, fromStartMinutes: move.fromStartMinutes })) });
     this.snapshots.set(date, current);
     return { taskId, date, startMinutes, proposal: { ...proposal, decision: "auto" }, snapshot: cloneSnapshot(current), changeSetId };
   }
@@ -234,9 +259,19 @@ export class InMemoryScheduleStore implements ScheduleStore {
     const change = this.changes.get(changeSetId);
     if (!change) throw new Error("CHANGE_SET_NOT_FOUND");
     const snapshot = await this.getSnapshot(change.date);
+    let moveTarget: { date: string; snapshot: ScheduleSnapshot } | null = null;
     if (change.kind === "insert") {
       snapshot.tasks = snapshot.tasks.filter((task) => task.id !== change.taskId);
       snapshot.blocks = snapshot.blocks.filter((block) => block.taskId !== change.taskId);
+    } else if ((change.kind === "place" || change.kind === "reschedule") && change.targetDate && change.targetDate !== change.date && change.taskId) {
+      const target = await this.getSnapshot(change.targetDate);
+      const movedTask = target.tasks.find((task) => task.id === change.taskId);
+      target.tasks = target.tasks.filter((task) => task.id !== change.taskId);
+      target.blocks = target.blocks.filter((block) => block.taskId !== change.taskId);
+      snapshot.tasks = snapshot.tasks.filter((task) => task.id !== change.taskId);
+      if (movedTask) snapshot.tasks.push({ ...movedTask, date: change.date });
+      if (change.kind === "reschedule") snapshot.blocks.push(...(change.blocks ?? []));
+      moveTarget = { date: change.targetDate, snapshot: target };
     } else if (change.kind === "place") {
       snapshot.blocks = snapshot.blocks.filter((block) => block.id !== change.blockId);
     } else if (change.kind === "arrange_batch") {
@@ -258,9 +293,10 @@ export class InMemoryScheduleStore implements ScheduleStore {
       if (block) block.startMinutes = change.fromStartMinutes;
     }
     for (const move of change.moves) {
-      const block = snapshot.blocks.find((item) => item.id === move.blockId);
+      const block = (moveTarget?.snapshot ?? snapshot).blocks.find((item) => item.id === move.blockId);
       if (block) block.startMinutes = move.fromStartMinutes;
     }
+    if (moveTarget) this.snapshots.set(moveTarget.date, moveTarget.snapshot);
     this.snapshots.set(change.date, snapshot);
     this.changes.delete(changeSetId);
     return cloneSnapshot(snapshot);

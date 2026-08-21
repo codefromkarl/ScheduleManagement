@@ -54,13 +54,14 @@ import { DEFAULT_TIMELINE_RANGE, deriveTimelineRange, expandTimelineRange, timel
 
 type ViewMode = "day" | "week";
 type DataSource = "demo" | "api" | "loading";
-type IntegrationStatus = { authDisabled?: boolean; databaseConfigured: boolean; aiConfigured: boolean; aiMode?: string; qqConfigured: boolean; pwaConfigured: boolean; workers?: Array<{ workerName: string; status: string; lastSuccessAt?: string | null; lastError?: string | null }> };
+type IntegrationStatus = { authDisabled?: boolean; databaseConfigured: boolean; aiConfigured: boolean; aiMode?: string; qqConfigured: boolean; pwaConfigured: boolean; reminderChannels?: Array<"qq" | "pwa">; pwaSubscriptionCount?: number; workers?: Array<{ workerName: string; status: string; lastSuccessAt?: string | null; lastError?: string | null }> };
 type ProjectSummary = { id?: string; name: string; count: number; tone: string; archived?: boolean; totalMinutes?: number; doneMinutes?: number; blockedCount?: number; overdueCount?: number; unplannedCount?: number; deadlineRiskCount?: number; progress?: number; remainingMinutes?: number; health?: "healthy" | "at_risk" | "blocked" | "empty"; healthReason?: string };
 type ChangeSummary = { id: string; source: string; status: string; originalCommand?: string | null; createdAt: string };
 type RecurrenceSummary = { id: string; taskId: string; frequency: "daily" | "weekly" | "workday" | "weekdays"; weekdays?: number[] | null; startDate: string; endDate?: string | null; timezone: string };
 type PendingReschedule = { taskId: string; date: string; startMinutes: number; moves: PreviewMove[]; reply: string };
 type PendingPlacement = { taskId: string; date: string; placementStartMinutes?: number; moves: PreviewMove[] };
-type ConflictMarker = { startMinutes: number; durationMinutes: number; reason: string };
+type ConflictMarker = { date: string; startMinutes: number; durationMinutes: number; reason: string };
+type DragPreview = { startMinutes: number; durationMinutes: number };
 type ProposalMove = { blockId: string; fromStartMinutes: number; toStartMinutes: number; durationMinutes: number };
 type TopLayer = "search" | "notifications" | "profile" | null;
 type ActiveSurface = "settings" | "add-task" | "task-detail" | "mobile-nav" | "unplanned" | "activity" | null;
@@ -70,13 +71,27 @@ type Confirmation =
   | { kind: "delete-task"; task: ScheduleItem }
   | { kind: "daily-close"; action: "unplan" | "move_tomorrow"; count: number };
 
-const reminderKindLabels: Record<ReminderSummary["kind"], string> = { start: "任务开始", schedule_change: "日程调整", daily_summary: "每日摘要" };
+const reminderKindLabels: Record<ReminderSummary["kind"], string> = { start: "任务开始", schedule_change: "日程调整", daily_summary: "每日摘要", test: "通道测试" };
 const reminderChannelLabels: Record<ReminderSummary["channel"], string> = { qq: "QQ", pwa: "PWA" };
 const reminderImportanceLabels: Record<ReminderImportanceReason, string> = { task_override: "单任务强制", high_priority: "高优先级", fixed_schedule: "固定安排", blocked_task: "阻塞", deadline_risk: "截止风险", impossible_capacity: "容量不可行", unhandled_high_priority: "重要任务待处理" };
 const projectHealthLabels: Record<NonNullable<ProjectSummary["health"]>, string> = { healthy: "正常", at_risk: "需留意", blocked: "已阻塞", empty: "待安排" };
 const recurrenceFrequencyLabels: Record<RecurrenceSummary["frequency"], string> = { daily: "每天", weekly: "每周", workday: "工作日", weekdays: "指定星期" };
 const priorityLabels: Record<ScheduleTask["priority"], string> = { high: "重要", normal: "普通", low: "低" };
 const reminderPolicyLabels: Record<ScheduleTask["reminderPolicy"], string> = { auto: "自动", always: "强制提醒", never: "不提醒" };
+
+function reminderDeliveryStatus(reminder: ReminderSummary) {
+  if (reminder.receivedAt) return "设备已收到";
+  if (reminder.status === "pending") return "等待发送";
+  if (reminder.status === "sending") return "发送中";
+  if (reminder.status === "sent") return reminder.channel === "qq" ? "QQ API 已接受，请确认客户端收到" : "推送服务已接受，等待设备回执";
+  if (reminder.status === "failed") return `发送失败：${reminder.error ?? "未知原因"}`;
+  return "已取消";
+}
+
+function hasReadyReminderChannel(status: IntegrationStatus) {
+  const channels = status.reminderChannels ?? ["qq", "pwa"];
+  return (channels.includes("qq") && status.qqConfigured) || (channels.includes("pwa") && status.pwaConfigured);
+}
 
 const mobileQuery = "(max-width: 767px)";
 const sidebarStorageKey = "goalset:sidebar-collapsed";
@@ -103,6 +118,19 @@ function getMobileSnapshot() {
 
 function getMobileServerSnapshot() {
   return false;
+}
+
+function subscribeToClock(callback: () => void) {
+  const intervalId = window.setInterval(callback, 60_000);
+  return () => window.clearInterval(intervalId);
+}
+
+function getClockSnapshot() {
+  return currentShanghaiMinutes();
+}
+
+function getClockServerSnapshot() {
+  return -1;
 }
 
 function subscribeToSidebar(callback: () => void) {
@@ -178,15 +206,6 @@ function weekdayLabel(dateKey: string) {
   return ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][date.getUTCDay()];
 }
 
-function weekCardTone(item?: ScheduleItem) {
-  if (!item) return "week-card--slate";
-  return {
-    "schedule-item--blue": "week-card--blue",
-    "schedule-item--orange": "week-card--orange",
-    "schedule-item--green": "week-card--green",
-  }[item.tone] ?? "week-card--purple";
-}
-
 function formatHour(hour: number) {
   return `${String(hour).padStart(2, "0")}:00`;
 }
@@ -208,11 +227,10 @@ function formatHours(minutes: number) {
   return rest ? `${hours}h ${rest}m` : `${hours}h`;
 }
 
-function currentTimeTop(dateKey: string, range: TimelineRange) {
+function currentTimeMarker(dateKey: string, range: TimelineRange, currentMinutes: number) {
   if (dateKey !== todayDateKey()) return null;
-  const minutes = currentShanghaiMinutes();
-  if (minutes < range.startMinutes || minutes > range.endMinutes) return null;
-  return `${((minutes - range.startMinutes) / (range.endMinutes - range.startMinutes)) * 100}%`;
+  if (currentMinutes < range.startMinutes || currentMinutes > range.endMinutes) return null;
+  return { top: `${((currentMinutes - range.startMinutes) / (range.endMinutes - range.startMinutes)) * 100}%`, label: formatMinutesOfDay(currentMinutes) };
 }
 
 function currentShanghaiMinutes() {
@@ -227,17 +245,15 @@ function snapshotRisk(snapshot: ReturnType<typeof scheduleSnapshotSchema.parse>)
   const riskTaskIds = new Set<string>();
   let unplannedCount = 0;
   let overdueCount = 0;
-  let doneCount = 0;
   const today = todayDateKey();
   for (const task of snapshot.tasks) {
-    if (task.status === "done") doneCount += 1;
     const unplanned = !blockTaskIds.has(task.id) && task.status !== "done";
     const overdue = task.status !== "done" && task.date < today;
     if (unplanned) unplannedCount += 1;
     if (overdue) overdueCount += 1;
     if (unplanned || overdue || task.status === "blocked") riskTaskIds.add(task.id);
   }
-  return { riskCount: riskTaskIds.size, unplannedCount, overdueCount, totalCount: snapshot.tasks.length, doneCount };
+  return { riskCount: riskTaskIds.size, unplannedCount, overdueCount, totalCount: snapshot.tasks.length };
 }
 
 function snapshotFreeMinutes(snapshot: ReturnType<typeof scheduleSnapshotSchema.parse>) {
@@ -261,46 +277,68 @@ function timeToMinutes(value: string) {
   return hours * 60 + minutes;
 }
 
-function getBlockStyle(item: ScheduleItem, range: TimelineRange): CSSProperties {
+function getBlockStyle(item: ScheduleItem, range: TimelineRange, compact = false): CSSProperties {
   const rangeMinutes = range.endMinutes - range.startMinutes;
   const top = ((item.startMinutes - range.startMinutes) / rangeMinutes) * 100;
   const height = (item.durationMinutes / rangeMinutes) * 100;
 
   return {
     top: `${top}%`,
-    height: `max(${height}%, 56px)`,
+    height: `max(${height}%, ${compact ? 42 : 56}px)`,
   };
 }
 
-function ScheduleBlock({ item, range, onSelect }: { item: ScheduleItem; range: TimelineRange; onSelect: (item: ScheduleItem, trigger: HTMLButtonElement) => void }) {
+function ScheduleBlock({ item, range, compact = false, onSelect }: { item: ScheduleItem; range: TimelineRange; compact?: boolean; onSelect: (item: ScheduleItem, trigger: HTMLButtonElement) => void }) {
+  const endMinutes = item.startMinutes + item.durationMinutes;
+  const timeLabel = `${formatMinutesOfDay(item.startMinutes)}–${formatMinutesOfDay(endMinutes)}`;
+  const disclosure = `${item.title}，${KIND_LABELS[item.kind]}任务，${STATUS_LABELS[item.status]}，${item.project}，${formatDuration(item.durationMinutes)}，${timeLabel}`;
+  const tooltipAbove = endMinutes > range.startMinutes + (range.endMinutes - range.startMinutes) * 0.75;
   return (
-    <button className={`schedule-item ${item.tone}`} style={getBlockStyle(item, range)} type="button" draggable={item.kind !== "fixed"} title={item.kind === "fixed" ? "固定安排请点击后修改时间" : "可以拖动改期，也可以点击查看详情"} onDragStart={(event) => { if (item.kind !== "fixed") { event.dataTransfer.setData("application/x-goalset-scheduled-task", item.taskId); event.dataTransfer.effectAllowed = "move"; } }} onClick={(event) => onSelect(item, event.currentTarget)}>
-      <div className="schedule-item__heading">
-        <span className="schedule-item__kind">{KIND_LABELS[item.kind]}</span>
-        <span className="schedule-item__status">{STATUS_LABELS[item.status]}</span>
-      </div>
-      <strong>{item.title}</strong>
-      <span className="schedule-item__meta">{formatDuration(item.durationMinutes)} · {item.project}</span>
+    <button aria-label={compact ? disclosure : undefined} className={`schedule-item ${compact ? `schedule-item--week ${tooltipAbove ? "schedule-item--tooltip-above" : ""}` : ""} ${item.tone}`} data-tooltip={compact ? disclosure : undefined} style={getBlockStyle(item, range, compact)} type="button" draggable={item.kind !== "fixed"} title={compact ? undefined : item.kind === "fixed" ? "固定安排请点击后修改时间" : "可以拖动改期，也可以点击查看详情"} onDragStart={(event) => { if (item.kind !== "fixed") { event.dataTransfer.setData("application/x-goalset-scheduled-task", item.taskId); event.dataTransfer.setData("application/x-goalset-duration", String(item.durationMinutes)); event.dataTransfer.effectAllowed = "move"; } }} onClick={(event) => onSelect(item, event.currentTarget)}>
+      {compact ? <><strong>{item.title}</strong><span className="schedule-item__meta">{timeLabel}</span></> : <><div className="schedule-item__heading"><span className="schedule-item__kind">{KIND_LABELS[item.kind]}</span><span className="schedule-item__status">{STATUS_LABELS[item.status]}</span></div><strong>{item.title}</strong><span className="schedule-item__meta">{formatDuration(item.durationMinutes)} · {item.project}</span></>}
     </button>
   );
 }
 
-function DayView({ dateKey, range, items, conflict, onSelect, onDropTask, onDropScheduledTask }: { dateKey: string; range: TimelineRange; items: ScheduleItem[]; conflict: ConflictMarker | null; onSelect: (item: ScheduleItem, trigger: HTMLButtonElement) => void; onDropTask: (taskId: string, startMinutes: number) => void; onDropScheduledTask: (taskId: string, startMinutes: number) => void }) {
-  const timeTop = currentTimeTop(dateKey, range);
+function TimelineGrid({ range, halfHours = false }: { range: TimelineRange; halfHours?: boolean }) {
+  const rangeMinutes = range.endMinutes - range.startMinutes;
+  const halfHourMarks = halfHours ? Array.from({ length: Math.floor(rangeMinutes / 60) }, (_, index) => range.startMinutes + index * 60 + 30).filter((minutes) => minutes < range.endMinutes) : [];
+  return <div className="timeline-grid" aria-hidden="true">{timelineHours(range).map((hour) => <span key={hour} />)}{halfHourMarks.map((minutes) => <i className="timeline-grid__half-hour" style={{ top: `${((minutes - range.startMinutes) / rangeMinutes) * 100}%` }} key={minutes} />)}</div>;
+}
+
+function TimelineDropPreview({ startMinutes, durationMinutes, range }: DragPreview & { range: TimelineRange }) {
+  const top = ((startMinutes - range.startMinutes) / (range.endMinutes - range.startMinutes)) * 100;
+  const height = (durationMinutes / (range.endMinutes - range.startMinutes)) * 100;
+  const timeRange = `${formatMinutesOfDay(startMinutes)}–${formatMinutesOfDay(startMinutes + durationMinutes)}`;
+  return <div className="timeline-drop-preview" style={{ top: `${top}%`, height: `max(${height}%, 22px)` }} role="status" aria-label={`目标时间 ${timeRange}`}><b>{timeRange}</b><small>释放后校验</small></div>;
+}
+
+function getDropTarget(event: DragEvent<HTMLDivElement>, range: TimelineRange) {
+  const taskId = event.dataTransfer.getData("application/x-goalset-task");
+  const scheduledTaskId = event.dataTransfer.getData("application/x-goalset-scheduled-task");
+  if (!taskId && !scheduledTaskId) return null;
+  const durationValue = Number(event.dataTransfer.getData("application/x-goalset-duration"));
+  const durationMinutes = Number.isInteger(durationValue) && durationValue > 0 ? durationValue : 15;
+  const bounds = event.currentTarget.getBoundingClientRect();
+  const ratio = Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height));
+  const rawMinutes = range.startMinutes + ratio * (range.endMinutes - range.startMinutes);
+  const startMinutes = Math.max(range.startMinutes, Math.min(range.endMinutes - 15, Math.round(rawMinutes / 15) * 15));
+  return { taskId, scheduledTaskId, startMinutes, durationMinutes };
+}
+
+function DayView({ dateKey, range, items, conflict, currentMinutes, onSelect, onDropTask, onDropScheduledTask }: { dateKey: string; range: TimelineRange; items: ScheduleItem[]; conflict: ConflictMarker | null; currentMinutes: number; onSelect: (item: ScheduleItem, trigger: HTMLButtonElement) => void; onDropTask: (taskId: string, startMinutes: number) => void; onDropScheduledTask: (taskId: string, startMinutes: number) => void }) {
+  const timeMarker = currentTimeMarker(dateKey, range, currentMinutes);
   const [dropActive, setDropActive] = useState(false);
+  const [dropPreview, setDropPreview] = useState<DragPreview | null>(null);
 
   function dropTask(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     setDropActive(false);
-    const taskId = event.dataTransfer.getData("application/x-goalset-task");
-    const scheduledTaskId = event.dataTransfer.getData("application/x-goalset-scheduled-task");
-    if (!taskId && !scheduledTaskId) return;
-    const bounds = event.currentTarget.getBoundingClientRect();
-    const ratio = Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height));
-    const rawMinutes = range.startMinutes + ratio * (range.endMinutes - range.startMinutes);
-    const startMinutes = Math.max(range.startMinutes, Math.min(range.endMinutes - 15, Math.round(rawMinutes / 15) * 15));
-    if (scheduledTaskId) onDropScheduledTask(scheduledTaskId, startMinutes);
-    else onDropTask(taskId, startMinutes);
+    setDropPreview(null);
+    const target = getDropTarget(event, range);
+    if (!target) return;
+    if (target.scheduledTaskId) onDropScheduledTask(target.scheduledTaskId, target.startMinutes);
+    else onDropTask(target.taskId, target.startMinutes);
   }
 
   return (
@@ -313,44 +351,68 @@ function DayView({ dateKey, range, items, conflict, onSelect, onDropTask, onDrop
         data-start-minutes={range.startMinutes}
         data-end-minutes={range.endMinutes}
         onDragEnter={() => setDropActive(true)}
-        onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropActive(false); }}
-        onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }}
+        onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) { setDropActive(false); setDropPreview(null); } }}
+        onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; const target = getDropTarget(event, range); setDropPreview(target ? { startMinutes: target.startMinutes, durationMinutes: target.durationMinutes } : null); }}
         onDrop={dropTask}
       >
-        <div className="timeline-grid" aria-hidden="true">
-          {timelineHours(range).map((hour) => <span key={hour} />)}
-        </div>
+        <TimelineGrid range={range} />
         {items.map((item) => <ScheduleBlock key={item.id} item={item} range={range} onSelect={onSelect} />)}
-        {conflict && <div className="timeline-conflict" style={{ top: `${((conflict.startMinutes - range.startMinutes) / (range.endMinutes - range.startMinutes)) * 100}%`, height: `max(${(conflict.durationMinutes / (range.endMinutes - range.startMinutes)) * 100}%, 42px)` }} role="alert"><strong>{formatMinutesOfDay(conflict.startMinutes)} 无法放置</strong><span>{conflict.reason}</span></div>}
-        {timeTop && <div className="current-time" style={{ top: timeTop }}><span /><b>现在</b></div>}
+        {dropPreview && <TimelineDropPreview {...dropPreview} range={range} />}
+        {conflict?.date === dateKey && <div className="timeline-conflict" style={{ top: `${((conflict.startMinutes - range.startMinutes) / (range.endMinutes - range.startMinutes)) * 100}%`, height: `max(${(conflict.durationMinutes / (range.endMinutes - range.startMinutes)) * 100}%, 42px)` }} role="alert"><strong>{formatMinutesOfDay(conflict.startMinutes)} 无法放置</strong><span>{conflict.reason}</span></div>}
+        {timeMarker && <div className="current-time" style={{ top: timeMarker.top }}><span /><b>现在 {timeMarker.label}</b></div>}
       </div>
     </div>
   );
 }
 
-function WeekView({ selectedDate, days, onSelectDay }: { selectedDate: string; days: Record<string, ScheduleItem[]> | null; onSelectDay: (dateKey: string) => void }) {
+function WeekDayTrack({ dateKey, selected, range, items, conflict, currentMinutes, onSelectDay, onSelect, onDropTask, onDropScheduledTask }: { dateKey: string; selected: boolean; range: TimelineRange; items: ScheduleItem[]; conflict: ConflictMarker | null; currentMinutes: number; onSelectDay: (dateKey: string) => void; onSelect: (item: ScheduleItem, trigger: HTMLButtonElement) => void; onDropTask: (taskId: string, dateKey: string, startMinutes: number) => void; onDropScheduledTask: (taskId: string, dateKey: string, startMinutes: number) => void }) {
+  const [dropActive, setDropActive] = useState(false);
+  const [dropPreview, setDropPreview] = useState<DragPreview | null>(null);
+  const timeMarker = currentTimeMarker(dateKey, range, currentMinutes);
+
+  function dropTask(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    setDropActive(false);
+    setDropPreview(null);
+    const target = getDropTarget(event, range);
+    if (!target) return;
+    onSelectDay(dateKey);
+    if (target.scheduledTaskId) onDropScheduledTask(target.scheduledTaskId, dateKey, target.startMinutes);
+    else onDropTask(target.taskId, dateKey, target.startMinutes);
+  }
+
   return (
-    <div className="week-view" aria-label="本周安排">
-      {weekDateKeys(selectedDate).map((dateKey) => {
-        const items = days?.[dateKey] ?? [];
-        const firstItem = items[0];
-        const scheduledMinutes = items.reduce((total, item) => total + item.durationMinutes, 0);
-        return (
-        <button
-          className={`week-column ${dateKey === selectedDate ? "week-column--active" : ""}`}
-          key={dateKey}
-          type="button"
-          onClick={() => onSelectDay(dateKey)}
-        >
-          <span className="week-column__day">{weekdayLabel(dateKey)}</span>
-          <span className="week-column__date">{dateKey.slice(5).replace("-", "/")}</span>
-          <span className={`week-card ${weekCardTone(firstItem)}`}>
-            <span className="week-card__metric">{items.length ? `${items.length} 项 · ${formatHours(scheduledMinutes)}` : "空闲"}</span>
-            <span className="week-card__preview">{firstItem?.title ?? "没有安排"}</span>
-          </span>
-        </button>
-        );
-      })}
+    <div
+      className={`week-timetable__track ${selected ? "week-timetable__track--selected" : ""} ${dropActive ? "timeline-track--drop-target" : ""}`}
+      aria-label={`${weekdayLabel(dateKey)} ${formatDateKey(dateKey)} 日程`}
+      data-date={dateKey}
+      data-start-minutes={range.startMinutes}
+      data-end-minutes={range.endMinutes}
+      onDragEnter={() => setDropActive(true)}
+      onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) { setDropActive(false); setDropPreview(null); } }}
+      onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; const target = getDropTarget(event, range); setDropPreview(target ? { startMinutes: target.startMinutes, durationMinutes: target.durationMinutes } : null); }}
+      onDrop={dropTask}
+    >
+      <TimelineGrid range={range} halfHours />
+      {items.map((item) => <ScheduleBlock key={item.id} item={item} range={range} compact onSelect={onSelect} />)}
+      {dropPreview && <TimelineDropPreview {...dropPreview} range={range} />}
+      {conflict?.date === dateKey && <div className="timeline-conflict timeline-conflict--week" style={{ top: `${((conflict.startMinutes - range.startMinutes) / (range.endMinutes - range.startMinutes)) * 100}%`, height: `max(${(conflict.durationMinutes / (range.endMinutes - range.startMinutes)) * 100}%, 34px)` }} role="alert"><strong>{formatMinutesOfDay(conflict.startMinutes)} 无法放置</strong><span>{conflict.reason}</span></div>}
+      {timeMarker && <div className="current-time current-time--week" style={{ top: timeMarker.top }}><span /><b>现在 {timeMarker.label}</b></div>}
+    </div>
+  );
+}
+
+function WeekView({ selectedDate, range, days, conflict, currentMinutes, onSelectDay, onSelect, onDropTask, onDropScheduledTask }: { selectedDate: string; range: TimelineRange; days: Record<string, ScheduleItem[]> | null; conflict: ConflictMarker | null; currentMinutes: number; onSelectDay: (dateKey: string) => void; onSelect: (item: ScheduleItem, trigger: HTMLButtonElement) => void; onDropTask: (taskId: string, dateKey: string, startMinutes: number) => void; onDropScheduledTask: (taskId: string, dateKey: string, startMinutes: number) => void }) {
+  const dates = weekDateKeys(selectedDate);
+  return (
+    <div className="week-timetable" aria-label="本周星期表">
+      <div className="week-timetable__canvas">
+        <div className="week-timetable__header"><span className="week-timetable__corner">时间</span>{dates.map((dateKey) => <button className={`week-column ${dateKey === selectedDate ? "week-column--active" : ""}`} key={dateKey} type="button" onClick={() => onSelectDay(dateKey)}><span className="week-column__day">{weekdayLabel(dateKey)}</span><span className="week-column__date">{dateKey.slice(5).replace("-", "/")}</span></button>)}</div>
+        <div className="week-timetable__body">
+          <div className="timeline-labels week-timetable__labels" aria-hidden="true">{timelineHours(range).map((hour) => <span key={hour}>{formatHour(hour)}</span>)}</div>
+          {dates.map((dateKey) => <WeekDayTrack key={dateKey} dateKey={dateKey} selected={dateKey === selectedDate} range={range} items={days?.[dateKey] ?? []} conflict={conflict} currentMinutes={currentMinutes} onSelectDay={onSelectDay} onSelect={onSelect} onDropTask={onDropTask} onDropScheduledTask={onDropScheduledTask} />)}
+        </div>
+      </div>
     </div>
   );
 }
@@ -393,6 +455,7 @@ export function ScheduleDashboard() {
   const router = useRouter();
   const isMobile = useSyncExternalStore(subscribeToMobile, getMobileSnapshot, getMobileServerSnapshot);
   const sidebarCollapsed = useSyncExternalStore(subscribeToSidebar, getSidebarSnapshot, getSidebarServerSnapshot);
+  const currentMinutes = useSyncExternalStore(subscribeToClock, getClockSnapshot, getClockServerSnapshot);
   const surfaceTriggerRef = useRef<HTMLElement | null>(null);
   const confirmationTriggerRef = useRef<HTMLElement | null>(null);
   const [topLayer, setTopLayer] = useState<TopLayer>(null);
@@ -412,9 +475,11 @@ export function ScheduleDashboard() {
   const [conflictMarker, setConflictMarker] = useState<ConflictMarker | null>(null);
   const [rescheduleTime, setRescheduleTime] = useState("09:00");
   const [batchBusy, setBatchBusy] = useState(false);
-  const [scheduleRisk, setScheduleRisk] = useState({ riskCount: 0, unplannedCount: 0, overdueCount: 0, totalCount: 0, doneCount: 0 });
+  const [scheduleRisk, setScheduleRisk] = useState({ riskCount: 0, unplannedCount: 0, overdueCount: 0, totalCount: 0 });
   const [scheduleFreeMinutes, setScheduleFreeMinutes] = useState<number | null>(null);
   const [weekSchedule, setWeekSchedule] = useState<Record<string, ScheduleItem[]> | null>(null);
+  const [weekTimelineRange, setWeekTimelineRange] = useState<TimelineRange>(DEFAULT_TIMELINE_RANGE);
+  const [weekScheduleRevision, setWeekScheduleRevision] = useState(0);
   const [dataSource, setDataSource] = useState<DataSource>("loading");
   const [selectedDate, setSelectedDate] = useState(todayDateKey);
   const [taskFormError, setTaskFormError] = useState("");
@@ -463,7 +528,7 @@ export function ScheduleDashboard() {
         if (!controller.signal.aborted) {
           setScheduleItems(DEMO_ITEMS);
           setUnplannedTasks([]);
-          setScheduleRisk({ riskCount: 0, unplannedCount: 0, overdueCount: 0, totalCount: DEMO_ITEMS.length, doneCount: DEMO_ITEMS.filter((item) => item.status === "done").length });
+          setScheduleRisk({ riskCount: 0, unplannedCount: 0, overdueCount: 0, totalCount: DEMO_ITEMS.length });
           setScheduleFreeMinutes(null);
           setTimelineRange(DEFAULT_TIMELINE_RANGE);
           setDataSource("demo");
@@ -478,16 +543,19 @@ export function ScheduleDashboard() {
       const response = await fetch(`/api/schedule?date=${dateKey}`, { signal: controller.signal, cache: "no-store" });
       if (!response.ok) throw new Error("week schedule request failed");
       const snapshot = scheduleSnapshotSchema.parse(await response.json());
-      return [dateKey, scheduleItemsFromSnapshot(snapshot)] as const;
+      return [dateKey, { items: scheduleItemsFromSnapshot(snapshot), range: deriveTimelineRange(snapshot) }] as const;
     }))
       .then((entries) => {
-        if (!controller.signal.aborted) setWeekSchedule(Object.fromEntries(entries));
+        if (!controller.signal.aborted) {
+          setWeekSchedule(Object.fromEntries(entries.map(([dateKey, day]) => [dateKey, day.items])));
+          setWeekTimelineRange(entries.reduce((range, [, day]) => ({ startMinutes: Math.min(range.startMinutes, day.range.startMinutes), endMinutes: Math.max(range.endMinutes, day.range.endMinutes) }), DEFAULT_TIMELINE_RANGE));
+        }
       })
       .catch(() => {
         if (!controller.signal.aborted) setWeekSchedule({});
       });
     return () => controller.abort();
-  }, [currentWeekDates]);
+  }, [currentWeekDates, weekScheduleRevision]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -514,7 +582,7 @@ export function ScheduleDashboard() {
   }, []);
 
   useEffect(() => {
-    fetch("/api/status", { cache: "no-store" }).then((response) => response.ok ? response.json() : Promise.reject(new Error("status request failed"))).then((body: IntegrationStatus) => setIntegrationStatus(body)).catch(() => undefined);
+    void refreshIntegrationStatus();
   }, []);
 
   useEffect(() => {
@@ -548,23 +616,30 @@ export function ScheduleDashboard() {
     },
     [project, projects, scheduleItems, searchQuery],
   );
+  const visibleWeekSchedule = useMemo(() => {
+    if (!weekSchedule) return null;
+    const query = searchQuery.trim().toLowerCase();
+    const selectedProject = projects.find((item) => item.name === project);
+    return Object.fromEntries(Object.entries(weekSchedule).map(([dateKey, items]) => [dateKey, items.filter((item) => {
+      const matchesProject = project === "全部安排" || item.project === project || item.project === selectedProject?.id;
+      const matchesSearch = !query || `${item.title} ${item.project}`.toLowerCase().includes(query);
+      return matchesProject && matchesSearch;
+    })]));
+  }, [project, projects, searchQuery, weekSchedule]);
   const scheduleStats = useMemo(() => {
-    const scheduledMinutes = scheduleItems.reduce((total, item) => total + item.durationMinutes, 0);
-    const doneCount = scheduleRisk.doneCount;
     const blockedCount = scheduleItems.filter((item) => item.status === "blocked").length;
-    return { taskCount: scheduleRisk.totalCount, scheduledMinutes, freeMinutes: scheduleFreeMinutes, doneCount, blockedCount, riskCount: scheduleRisk.riskCount, unplannedCount: scheduleRisk.unplannedCount, overdueCount: scheduleRisk.overdueCount };
+    return { freeMinutes: scheduleFreeMinutes, blockedCount, riskCount: scheduleRisk.riskCount, unplannedCount: scheduleRisk.unplannedCount, overdueCount: scheduleRisk.overdueCount };
   }, [scheduleFreeMinutes, scheduleItems, scheduleRisk]);
-  const nextItem = useMemo(() => {
-    const candidates = visibleItems.filter((item) => item.status !== "done").sort((left, right) => left.startMinutes - right.startMinutes);
-    if (selectedDate !== todayDateKey()) return candidates[0] ?? null;
-    const now = currentShanghaiMinutes();
-    return candidates.find((item) => item.startMinutes + item.durationMinutes > now) ?? candidates[0] ?? null;
-  }, [selectedDate, visibleItems]);
   const closeableCount = useMemo(() => scheduleItems.filter((item) => item.status !== "done" && item.kind !== "fixed").length + unplannedTasks.filter((item) => item.kind !== "fixed").length, [scheduleItems, unplannedTasks]);
   const confirmationCopy = confirmationDetails(confirmation);
 
   function notify(message: string) {
     setNotice(message);
+  }
+
+  function refreshWeekSchedule(clear = false) {
+    if (clear) setWeekSchedule(null);
+    setWeekScheduleRevision((revision) => revision + 1);
   }
 
   function resolvePreviewMoves(moves: ProposalMove[] = [], snapshotValue?: unknown): PreviewMove[] {
@@ -621,7 +696,73 @@ export function ScheduleDashboard() {
   }
 
   async function enablePwa() {
-    notify((await enablePwaNotifications()).message);
+    const result = await enablePwaNotifications();
+    notify(result.message);
+    if (result.ok) await refreshIntegrationStatus();
+  }
+
+  async function refreshIntegrationStatus() {
+    const response = await fetch("/api/status", { cache: "no-store" }).catch(() => null);
+    if (!response?.ok) return;
+    setIntegrationStatus(await response.json() as IntegrationStatus);
+  }
+
+  async function testPwa() {
+    const response = await fetch("/api/pwa/test", { method: "POST" });
+    const body = await response.json().catch(() => null) as { reminderId?: string; error?: { message?: string } } | null;
+    if (!response.ok || !body?.reminderId) {
+      notify(body?.error?.message ?? "PWA 测试提醒创建失败");
+      return;
+    }
+    notify("测试提醒已排队，等待设备回执…");
+    for (let attempt = 0; attempt < 45; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const reminderResponse = await fetch("/api/reminders", { cache: "no-store" }).catch(() => null);
+      if (!reminderResponse?.ok) continue;
+      const parsed = reminderListResponseSchema.safeParse(await reminderResponse.json().catch(() => null));
+      if (!parsed.success) continue;
+      setReminders(parsed.data.reminders);
+      const reminder = parsed.data.reminders.find((item) => item.id === body.reminderId);
+      if (reminder?.receivedAt) {
+        notify("PWA 测试成功：设备服务工作线程已回执");
+        await refreshIntegrationStatus();
+        return;
+      }
+      if (reminder?.status === "failed") {
+        notify(`PWA 测试失败：${reminder.error ?? "推送服务未接受"}`);
+        return;
+      }
+    }
+    notify("PWA 测试尚未收到设备回执，请检查 worker 和系统通知");
+  }
+
+  async function testQq() {
+    const response = await fetch("/api/qq/test", { method: "POST" });
+    const body = await response.json().catch(() => null) as { reminderId?: string; error?: { message?: string } } | null;
+    if (!response.ok || !body?.reminderId) {
+      notify(body?.error?.message ?? "QQ 测试提醒创建失败");
+      return;
+    }
+    notify("QQ 测试提醒已排队…");
+    for (let attempt = 0; attempt < 45; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const reminderResponse = await fetch("/api/reminders", { cache: "no-store" }).catch(() => null);
+      if (!reminderResponse?.ok) continue;
+      const parsed = reminderListResponseSchema.safeParse(await reminderResponse.json().catch(() => null));
+      if (!parsed.success) continue;
+      setReminders(parsed.data.reminders);
+      const reminder = parsed.data.reminders.find((item) => item.id === body.reminderId);
+      if (reminder?.status === "sent") {
+        notify("QQ API 已接受测试提醒，请确认 QQ 客户端收到消息");
+        await refreshIntegrationStatus();
+        return;
+      }
+      if (reminder?.status === "failed") {
+        notify(`QQ 测试失败：${reminder.error ?? "QQ API 未接受"}`);
+        return;
+      }
+    }
+    notify("QQ 测试仍在等待发送，请检查 QQ worker 状态");
   }
 
   function moveDate(days: number) {
@@ -631,7 +772,7 @@ export function ScheduleDashboard() {
   }
 
   function selectDate(dateKey: string, message = `已切换到 ${formatDayHeading(dateKey)}`) {
-    setWeekSchedule(null);
+    refreshWeekSchedule(true);
     setSelectedDate(dateKey);
     setScheduleFreeMinutes(null);
     setDataSource("loading");
@@ -639,7 +780,14 @@ export function ScheduleDashboard() {
   }
 
   function selectWeekDay(dateKey: string) {
-    selectDate(dateKey);
+    if (dateKey === selectedDate) {
+      notify(`已选中 ${formatDayHeading(dateKey)}`);
+      return;
+    }
+    setSelectedDate(dateKey);
+    setScheduleFreeMinutes(null);
+    setDataSource("loading");
+    notify(`已选中 ${formatDayHeading(dateKey)}`);
   }
 
   function createProject(event: FormEvent<HTMLFormElement>) {
@@ -676,6 +824,7 @@ export function ScheduleDashboard() {
   }
 
   function selectTask(item: ScheduleItem, trigger?: HTMLElement | null) {
+    if (item.date !== selectedDate) setSelectedDate(item.date);
     setSelectedTask(item);
     openSurface("task-detail", trigger);
     setTaskTitle(item.title);
@@ -697,7 +846,7 @@ export function ScheduleDashboard() {
     }
     const snapshot = scheduleSnapshotSchema.parse(body.snapshot);
     setSelectedDate(snapshot.date);
-    setWeekSchedule(null);
+    refreshWeekSchedule();
     applySnapshot(snapshot);
     if (selectedTask?.taskId === item.taskId) {
       const refreshed = scheduleItemsFromSnapshot(snapshot).find((candidate) => candidate.taskId === item.taskId);
@@ -753,6 +902,7 @@ export function ScheduleDashboard() {
     if (snapshotResponse.ok) {
       const snapshot = scheduleSnapshotSchema.parse(await snapshotResponse.json());
       applySnapshot(snapshot);
+      refreshWeekSchedule();
     }
     setSelectedTask(null);
     notify(action === "skip" ? "已跳过这一次重复任务" : "这一次重复任务已单独调整");
@@ -774,6 +924,7 @@ export function ScheduleDashboard() {
     const snapshot = scheduleSnapshotSchema.parse(body.snapshot);
     applySnapshot(snapshot);
     setSelectedDate(pendingReschedule.date);
+    refreshWeekSchedule();
     setPendingReschedule(null);
     notify("已确认改期，受影响任务已重新安排");
   }
@@ -792,6 +943,7 @@ export function ScheduleDashboard() {
     }
     const snapshot = scheduleSnapshotSchema.parse(body.snapshot);
     applySnapshot(snapshot);
+    refreshWeekSchedule();
     setSelectedTask(null);
     setActiveSurface(null);
     void refreshReminders();
@@ -820,12 +972,14 @@ export function ScheduleDashboard() {
     if (!response.ok || !body?.snapshot) {
       const reason = body?.proposal?.reasons?.join(" ") ?? body?.error?.message ?? "该时间与现有安排冲突，任务仍在待安排中";
       const task = unplannedTasks.find((item) => item.id === taskId);
-      if (startMinutes !== undefined && task) { setConflictMarker({ startMinutes, durationMinutes: task.estimatedMinutes, reason }); setTimelineRange((current) => expandTimelineRange(current, startMinutes, task.estimatedMinutes)); }
+      if (startMinutes !== undefined && task) { setConflictMarker({ date: targetDate, startMinutes, durationMinutes: task.estimatedMinutes, reason }); setTimelineRange((current) => expandTimelineRange(current, startMinutes, task.estimatedMinutes)); setWeekTimelineRange((current) => expandTimelineRange(current, startMinutes, task.estimatedMinutes)); }
       notify(reason);
       return;
     }
     const snapshot = scheduleSnapshotSchema.parse(body.snapshot);
+    setSelectedDate(snapshot.date);
     applySnapshot(snapshot);
+    refreshWeekSchedule();
     setLastChangeSetId(body.changeSetId ?? null);
     setPlacementTaskId(null);
     setPendingPlacement(null);
@@ -842,25 +996,27 @@ export function ScheduleDashboard() {
   }
 
   async function rescheduleScheduledTask(taskId: string, startMinutes: number, targetDate = selectedDate) {
-    const item = scheduleItems.find((candidate) => candidate.taskId === taskId);
+    const item = scheduleItems.find((candidate) => candidate.taskId === taskId) ?? Object.values(weekSchedule ?? {}).flat().find((candidate) => candidate.taskId === taskId);
     if (!item) return;
     const response = await fetch(`/api/tasks/${taskId}/reschedule`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ date: targetDate, startMinutes }) });
     const body = await response.json().catch(() => null) as { snapshot?: unknown; changeSetId?: string; proposal?: { reasons?: string[] }; error?: { message?: string } } | null;
     if (!response.ok || !body?.snapshot) {
       const reason = body?.proposal?.reasons?.join(" ") ?? body?.error?.message ?? "该时间与现有安排冲突，原时间保持不变";
-      setConflictMarker({ startMinutes, durationMinutes: item.durationMinutes, reason });
+      setConflictMarker({ date: targetDate, startMinutes, durationMinutes: item.durationMinutes, reason });
       setTimelineRange((current) => expandTimelineRange(current, startMinutes, item.durationMinutes));
+      setWeekTimelineRange((current) => expandTimelineRange(current, startMinutes, item.durationMinutes));
       notify(reason);
       return;
     }
     const snapshot = scheduleSnapshotSchema.parse(body.snapshot);
+    setSelectedDate(snapshot.date);
     applySnapshot(snapshot);
     const refreshed = scheduleItemsFromSnapshot(snapshot).find((candidate) => candidate.taskId === taskId) ?? null;
     setSelectedTask(refreshed);
     if (refreshed) setRescheduleTime(formatMinutesOfDay(refreshed.startMinutes));
     setLastChangeSetId(body.changeSetId ?? null);
     setConflictMarker(null);
-    setWeekSchedule(null);
+    refreshWeekSchedule();
     notify(`任务已改到 ${formatMinutesOfDay(startMinutes)}`);
   }
 
@@ -876,7 +1032,7 @@ export function ScheduleDashboard() {
       applySnapshot(scheduleSnapshotSchema.parse(body.snapshot));
       setLastChangeSetId(body.changeSetId ?? null);
       setConflictMarker(null);
-      setWeekSchedule(null);
+      refreshWeekSchedule();
       if ((body.remainingTaskIds?.length ?? 0) === 0) setActiveSurface(null);
       notify(body.arrangedTaskIds?.length ? `已按规则安排 ${body.arrangedTaskIds.length} 项，${body.remainingTaskIds?.length ?? 0} 项继续待安排` : "当前没有能安全排入的待安排任务");
     } finally {
@@ -898,7 +1054,7 @@ export function ScheduleDashboard() {
       applySnapshot(snapshot);
       setLastChangeSetId(body.changeSetId ?? null);
       setConflictMarker(null);
-      setWeekSchedule(null);
+      refreshWeekSchedule();
       notify(action === "move_tomorrow" ? `已将 ${body.affectedTaskIds?.length ?? 0} 项移到明天待安排` : `已将 ${body.affectedTaskIds?.length ?? 0} 项移回今日待安排`);
     } finally {
       setBatchBusy(false);
@@ -942,16 +1098,17 @@ export function ScheduleDashboard() {
         setPendingReschedule({ taskId: body.reschedule.taskId, date: body.reschedule.date, startMinutes: body.reschedule.startMinutes, moves: resolvePreviewMoves(body.proposal?.moves, body.snapshot), reply: body.reply ?? "AI 建议调整现有日程" });
         notify("AI 建议改期，需要确认后才会移动其他任务");
       } else if (response.status === 409 && body?.task) {
-        if (body.task.date !== selectedDate) { setSelectedDate(body.task.date); setWeekSchedule(null); }
+        if (body.task.date !== selectedDate) { setSelectedDate(body.task.date); refreshWeekSchedule(); }
         setPendingTask(body.task);
         setAddMode("manual");
         setActiveSurface("add-task");
         setTaskFormError(`规则检测到需要移动 ${body.proposal?.moves?.length ?? 1} 个弹性任务，请确认后执行。`);
         notify("已生成需要确认的调整方案");
       } else if (body?.snapshot) {
-        if (body.task?.date && body.task.date !== selectedDate) { setSelectedDate(body.task.date); setWeekSchedule(null); }
+        if (body.task?.date && body.task.date !== selectedDate) { setSelectedDate(body.task.date); refreshWeekSchedule(); }
         const snapshot = scheduleSnapshotSchema.parse(body.snapshot);
         applySnapshot(snapshot);
+        refreshWeekSchedule();
         setLastChangeSetId(body.changeSetId ?? null);
         void refreshReminders();
         notify(body?.kind === "updated" ? "任务状态已更新" : body?.kind === "rescheduled" ? optimize ? "AI 优化已完成改期" : "任务已按规则完成改期" : body?.kind === "unplanned" ? "没有安全空档，任务已保存到待安排" : optimize ? "AI 已将任务放入优化后的时段" : "任务已按规则放入空闲时段");
@@ -1000,6 +1157,7 @@ export function ScheduleDashboard() {
     }
     const snapshot = scheduleSnapshotSchema.parse(body.snapshot);
     applySnapshot(snapshot);
+    refreshWeekSchedule();
     setLastChangeSetId(body.changeSetId ?? null);
     setActiveSurface(null);
     void refreshReminders();
@@ -1016,6 +1174,7 @@ export function ScheduleDashboard() {
     }
     const snapshot = scheduleSnapshotSchema.parse(body.snapshot);
     applySnapshot(snapshot);
+    refreshWeekSchedule();
     setLastChangeSetId(body.changeSetId ?? null);
     setPendingTask(null);
     setActiveSurface(null);
@@ -1034,7 +1193,7 @@ export function ScheduleDashboard() {
     }
     const snapshot = scheduleSnapshotSchema.parse(body.snapshot);
     setSelectedDate(snapshot.date);
-    setWeekSchedule(null);
+    refreshWeekSchedule();
     applySnapshot(snapshot);
     setLastChangeSetId(null);
     void refreshReminders();
@@ -1058,7 +1217,7 @@ export function ScheduleDashboard() {
           <div className="topbar-actions">
             {searchQuery && topLayer !== "search" && <Button className="active-search-chip" variant="soft" size="sm" type="button" aria-label={`清除搜索：${searchQuery}`} onClick={() => setSearchQuery("")}>搜索：{searchQuery}<X size={13} /></Button>}
             <Popover open={topLayer === "search"} onOpenChange={(open) => { setTopLayer(open ? "search" : null); if (!open) setSearchQuery(""); }}><PopoverTrigger asChild><Button className="icon-button" variant="ghost" size="icon" type="button" aria-label="搜索" aria-expanded={topLayer === "search"}><Search size={17} /></Button></PopoverTrigger><PopoverContent className="search-popover"><label htmlFor="global-search">搜索任务或项目</label><div><Input id="global-search" value={searchQuery} onChange={(event) => { setSearchQuery(event.target.value); if (event.target.value.trim()) setViewOverride("day"); }} placeholder="输入标题或项目…" autoFocus />{searchQuery && <Button variant="ghost" size="icon" type="button" aria-label="清除搜索" onClick={() => setSearchQuery("")}><X size={14} /></Button>}</div></PopoverContent></Popover>
-            <Popover open={topLayer === "notifications"} onOpenChange={(open) => setTopLayer(open ? "notifications" : null)}><PopoverTrigger asChild><Button className="icon-button notification-button" variant="ghost" size="icon" type="button" aria-label="通知" aria-expanded={topLayer === "notifications"}><Bell size={16} />{reminders.some((reminder) => reminder.status === "pending" || reminder.status === "failed") && <i />}</Button></PopoverTrigger><PopoverContent className="notification-popover"><strong>通知</strong>{reminders.length === 0 ? <><p>暂无重要提醒记录</p><small>高优先级任务、固定安排、重要调整和真实风险会在配置渠道后出现在这里。</small></> : <div className="notification-list">{reminders.slice(0, 6).map((reminder) => <div className="notification-row" key={reminder.id}><div><strong>{reminderKindLabels[reminder.kind]} · {reminderChannelLabels[reminder.channel]}</strong><span>{reminder.status === "pending" ? "等待发送" : reminder.status === "sending" ? "发送中" : reminder.status === "sent" ? "已发送" : reminder.status === "failed" ? `发送失败：${reminder.error ?? "未知原因"}` : "已取消"}{reminder.importanceReasons?.length ? ` · ${reminder.importanceReasons.map((reason) => reminderImportanceLabels[reason]).join("、")}` : ""}</span></div>{reminder.status === "failed" && <Button variant="ghost" size="sm" type="button" onClick={() => void retryReminder(reminder.id)}>重试</Button>}</div>)}</div>}</PopoverContent></Popover>
+            <Popover open={topLayer === "notifications"} onOpenChange={(open) => setTopLayer(open ? "notifications" : null)}><PopoverTrigger asChild><Button className="icon-button notification-button" variant="ghost" size="icon" type="button" aria-label="通知" aria-expanded={topLayer === "notifications"}><Bell size={16} />{reminders.some((reminder) => reminder.status === "pending" || reminder.status === "failed") && <i />}</Button></PopoverTrigger><PopoverContent className="notification-popover"><strong>通知</strong>{reminders.length === 0 ? <><p>暂无重要提醒记录</p><small>高优先级任务、固定安排、重要调整和真实风险会在配置渠道后出现在这里。</small></> : <div className="notification-list">{reminders.slice(0, 6).map((reminder) => <div className="notification-row" key={reminder.id}><div><strong>{reminderKindLabels[reminder.kind]} · {reminderChannelLabels[reminder.channel]}</strong><span>{reminderDeliveryStatus(reminder)}{reminder.importanceReasons?.length ? ` · ${reminder.importanceReasons.map((reason) => reminderImportanceLabels[reason]).join("、")}` : ""}</span></div>{reminder.status === "failed" && <Button variant="ghost" size="sm" type="button" onClick={() => void retryReminder(reminder.id)}>重试</Button>}</div>)}</div>}</PopoverContent></Popover>
             <Button className="icon-button notification-button" variant="ghost" size="icon" type="button" aria-label="活动记录" aria-haspopup="dialog" onClick={(event) => openSurface("activity", event.currentTarget)}><History size={16} />{changes.length > 0 && <i />}</Button>
             <DropdownMenu open={topLayer === "profile"} onOpenChange={(open) => setTopLayer(open ? "profile" : null)}><DropdownMenuTrigger asChild><Button className="avatar-button" variant="ghost" size="icon" type="button" aria-label="个人菜单" aria-expanded={topLayer === "profile"}>Y</Button></DropdownMenuTrigger><DropdownMenuContent><DropdownMenuLabel>Yuanzhi · 个人工作区</DropdownMenuLabel><DropdownMenuSeparator /><DropdownMenuItem onSelect={() => openSurface("settings", document.querySelector('button[aria-label="个人菜单"]'))}><Settings2 size={15} />账号设置</DropdownMenuItem>{integrationStatus.authDisabled ? <DropdownMenuItem disabled>当前无需密码</DropdownMenuItem> : <DropdownMenuItem onSelect={async () => { await fetch("/api/auth/logout", { method: "POST" }); router.replace("/login"); router.refresh(); }}>退出登录</DropdownMenuItem>}</DropdownMenuContent></DropdownMenu>
           </div>
@@ -1067,10 +1226,10 @@ export function ScheduleDashboard() {
         {pendingReschedule && <ScheduleChangePreview summary={pendingReschedule.reply} placementStartMinutes={pendingReschedule.startMinutes} moves={pendingReschedule.moves} confirmLabel="确认改期" onConfirm={() => void confirmPendingReschedule()} onCancel={() => setPendingReschedule(null)} />}
         {pendingPlacement && <ScheduleChangePreview summary={`AI 优化 ${formatDateKey(pendingPlacement.date)} 的待安排任务`} placementStartMinutes={pendingPlacement.placementStartMinutes} moves={pendingPlacement.moves} confirmLabel="确认优化" onConfirm={() => void confirmPendingPlacement()} onCancel={() => setPendingPlacement(null)} />}
 
-        <Sheet open={activeSurface === "settings"} onOpenChange={(open) => { if (!open) setActiveSurface(null); }}><SheetContent title="设置与偏好" description="管理可用时间、缓冲、提醒和集成状态。" returnFocusRef={surfaceTriggerRef}><QuickSettings bufferMinutes={bufferMinutes} onBufferChange={saveBuffer} onPwaEnable={enablePwa} onNotify={notify} onClose={() => setActiveSurface(null)} showHeader={false} workers={integrationStatus.workers} qqConfigured={integrationStatus.qqConfigured} /></SheetContent></Sheet>
+        <Sheet open={activeSurface === "settings"} onOpenChange={(open) => { if (!open) setActiveSurface(null); }}><SheetContent title="设置与偏好" description="管理可用时间、缓冲、提醒和集成状态。" returnFocusRef={surfaceTriggerRef}><QuickSettings bufferMinutes={bufferMinutes} onBufferChange={saveBuffer} onQqTest={testQq} onPwaEnable={enablePwa} onPwaTest={testPwa} onNotify={notify} onClose={() => setActiveSurface(null)} showHeader={false} workers={integrationStatus.workers} qqConfigured={integrationStatus.qqConfigured} pwaConfigured={integrationStatus.pwaConfigured} pwaSubscriptionCount={integrationStatus.pwaSubscriptionCount ?? 0} reminderChannels={integrationStatus.reminderChannels} /></SheetContent></Sheet>
         <Sheet open={activeSurface === "mobile-nav"} onOpenChange={(open) => { if (!open) setActiveSurface(null); }}><SheetContent title="导航与项目" description="切换项目、创建项目或打开工作区设置。" returnFocusRef={surfaceTriggerRef}><div className="mobile-navigation"><ProjectNavigation sectionId="mobile-projects" projects={projects} selectedProject={project} showNewProject={showNewProject} newProjectName={newProjectName} onToggleNewProject={() => setShowNewProject((current) => !current)} onNewProjectNameChange={setNewProjectName} onCreateProject={createProject} onSelectProject={(name) => { setProject(name); setViewOverride("day"); setActiveSurface(null); notify(`已筛选项目「${name}」`); }} onArchiveProject={(item) => void archiveProject(item)} /><div className="mobile-navigation__actions"><Button variant="outline" type="button" onClick={() => openSurface("settings", document.querySelector(".mobile-menu-button"))}><Settings2 size={16} />设置与偏好</Button><Button variant="ghost" type="button" onClick={() => openSurface("settings", document.querySelector(".mobile-menu-button"))}><span className="mobile-navigation__avatar">Y</span>Yuanzhi · 个人工作区</Button></div></div></SheetContent></Sheet>
         <ConfirmDialog open={Boolean(confirmation)} title={confirmationCopy.title} description={confirmationCopy.description} confirmLabel={confirmationCopy.confirmLabel} danger={confirmationCopy.danger} onConfirm={() => { if (confirmation) void confirmRequestedAction(confirmation); }} onOpenChange={(open) => { if (!open) setConfirmation(null); }} returnFocusRef={confirmationTriggerRef} />
-        <Sheet open={activeSurface === "unplanned"} onOpenChange={(open) => { if (!open) { setActiveSurface(null); setPlacementTaskId(null); } }}><SheetContent title={`待安排 ${unplannedTasks.length} 项`} description="选择明确时间、按规则批量安排，或显式请求 AI 优化。" returnFocusRef={surfaceTriggerRef}><section className="unplanned-tray unplanned-tray--sheet" aria-labelledby="unplanned-sheet-title"><div className="unplanned-section__heading"><div><strong id="unplanned-sheet-title">优先处理高优先级和临近截止任务</strong><small>桌面端也可以关闭此面板后将任务拖到时间轴。</small></div><div className="unplanned-section__actions"><Button variant="soft" size="sm" type="button" disabled={batchBusy} onClick={() => void arrangeAllUnplanned()}>{batchBusy ? "安排中…" : "按规则安排全部"}</Button></div></div><div className="unplanned-list">{unplannedTasks.map((task) => <article className="unplanned-row" draggable key={task.id} onDragStart={(event) => { event.dataTransfer.setData("application/x-goalset-task", task.id); event.dataTransfer.effectAllowed = "move"; }}><GripVertical className="unplanned-row__grip" size={15} aria-hidden="true" /><div className="unplanned-row__body"><strong>{task.title}</strong><small>{KIND_LABELS[task.kind]} · {formatDuration(task.estimatedMinutes)} · {priorityLabels[task.priority]}{task.deadlineMinutes === undefined ? "" : ` · ${formatMinutesOfDay(task.deadlineMinutes)} 前`}</small>{placementTaskId === task.id && <div className="unplanned-placement"><Clock3 size={14} /><label className="sr-only" htmlFor={`placement-${task.id}`}>开始时间</label><input id={`placement-${task.id}`} className="native-input" type="time" step={900} value={placementTime} onChange={(event) => setPlacementTime(event.target.value)} /><Button variant="soft" size="sm" type="button" onClick={() => void scheduleUnplannedTask(task.id, "rules", timeToMinutes(placementTime))}>确认布置</Button><Button variant="ghost" size="sm" type="button" onClick={() => setPlacementTaskId(null)}>取消</Button></div>}</div><div className="unplanned-row__actions"><Button variant="outline" size="sm" type="button" onClick={() => beginUnplannedPlacement(task)}>选择时间</Button><Button variant="soft" size="sm" type="button" onClick={() => void scheduleUnplannedTask(task.id, "optimize")}><Sparkles size={12} /> AI 优化</Button></div></article>)}</div></section></SheetContent></Sheet>
+        <Sheet open={activeSurface === "unplanned"} onOpenChange={(open) => { if (!open) { setActiveSurface(null); setPlacementTaskId(null); } }}><SheetContent title={`待安排 ${unplannedTasks.length} 项`} description="选择明确时间、按规则批量安排，或显式请求 AI 优化。" returnFocusRef={surfaceTriggerRef}><section className="unplanned-tray unplanned-tray--sheet" aria-labelledby="unplanned-sheet-title"><div className="unplanned-section__heading"><div><strong id="unplanned-sheet-title">优先处理高优先级和临近截止任务</strong><small>精确选时、批量安排和 AI 优化都在此处；桌面拖放请使用 Dashboard 上的紧凑任务条。</small></div><div className="unplanned-section__actions"><Button variant="soft" size="sm" type="button" disabled={batchBusy} onClick={() => void arrangeAllUnplanned()}>{batchBusy ? "安排中…" : "按规则安排全部"}</Button></div></div><div className="unplanned-list">{unplannedTasks.map((task) => <article className="unplanned-row" key={task.id}><div className="unplanned-row__body"><strong>{task.title}</strong><small>{KIND_LABELS[task.kind]} · {formatDuration(task.estimatedMinutes)} · {priorityLabels[task.priority]}{task.deadlineMinutes === undefined ? "" : ` · ${formatMinutesOfDay(task.deadlineMinutes)} 前`}</small>{placementTaskId === task.id && <div className="unplanned-placement"><Clock3 size={14} /><label className="sr-only" htmlFor={`placement-${task.id}`}>开始时间</label><input id={`placement-${task.id}`} className="native-input" type="time" step={900} value={placementTime} onChange={(event) => setPlacementTime(event.target.value)} /><Button variant="soft" size="sm" type="button" onClick={() => void scheduleUnplannedTask(task.id, "rules", timeToMinutes(placementTime))}>确认布置</Button><Button variant="ghost" size="sm" type="button" onClick={() => setPlacementTaskId(null)}>取消</Button></div>}</div><div className="unplanned-row__actions"><Button variant="outline" size="sm" type="button" onClick={() => beginUnplannedPlacement(task)}>选择时间</Button><Button variant="soft" size="sm" type="button" onClick={() => void scheduleUnplannedTask(task.id, "optimize")}><Sparkles size={12} /> AI 优化</Button></div></article>)}</div></section></SheetContent></Sheet>
         <Sheet open={activeSurface === "activity"} onOpenChange={(open) => { if (!open) setActiveSurface(null); }}><SheetContent title="活动与风险" description="查看容量、跨日期待安排和最近日程变更。" returnFocusRef={surfaceTriggerRef}><div className="activity-sheet"><CapacitySummary days={capacityDays} /><UnplannedOverview groups={unplannedGroups} onSelectDate={(date) => { setSelectedDate(date); setActiveSurface(null); }} />{scheduleStats.riskCount > 0 && <section className="attention-card"><div className="panel-heading"><div><span className="panel-icon panel-icon--warm"><CalendarDays size={14} /></span><strong>所选日期需要处理</strong></div><Badge className="risk-badge">{scheduleStats.riskCount} 项</Badge></div><div className="attention-list">{scheduleStats.unplannedCount > 0 && <span><strong>{scheduleStats.unplannedCount}</strong> 项未排期</span>}{scheduleStats.overdueCount > 0 && <span><strong>{scheduleStats.overdueCount}</strong> 项已逾期</span>}{scheduleStats.blockedCount > 0 && <span><strong>{scheduleStats.blockedCount}</strong> 项已阻塞</span>}</div>{unplannedTasks.length > 0 && <Button variant="soft" size="sm" type="button" onClick={() => openSurface("unplanned", document.querySelector('button[aria-label="活动记录"]'))}>处理待安排</Button>}</section>}<section className="change-card"><div className="change-card__title"><span>最近变更</span><span className="change-card__time">{changes.length} 条</span></div>{changes.length ? <div className="change-history-list">{changes.map((change) => <div className="change-history-row" key={change.id}><span>{change.originalCommand ?? "未命名变更"}</span><small>{change.source} · {change.status}</small></div>)}</div> : <p className="activity-empty">暂无变更记录</p>}{changes.length > 0 && <Button variant="outline" size="sm" type="button" onClick={exportChangeHistory}>导出 CSV</Button>}</section></div></SheetContent></Sheet>
 
         <div className={`content-grid ${view === "week" ? "content-grid--planning" : "content-grid--single"}`}>
@@ -1105,14 +1264,12 @@ export function ScheduleDashboard() {
                 {taskFormError && <p className="task-form__error" role="alert">{taskFormError}</p>}<div className="task-form__actions"><span>{pendingTask ? "原日程尚未改变" : `目标日期：${formatDateKey(selectedDate)}`}</span>{pendingTask && <Button variant="soft" size="sm" type="button" onClick={confirmTask}>确认移动并排入</Button>}<Button variant="default" size="sm" type="submit">{pendingTask ? "重新计算" : "自动排入空档"}</Button></div>
               </form></section>}</SheetContent></Sheet>
 
-            {nextItem && <section className="next-up-card" aria-label="下一项任务"><div><span>{selectedDate === todayDateKey() ? "下一项" : `${formatDateKey(selectedDate)} · 第一项`}</span><strong>{formatMinutesOfDay(nextItem.startMinutes)} · {nextItem.title}</strong><small>{formatDuration(nextItem.durationMinutes)} · {nextItem.project}</small></div><div className="next-up-card__actions">{nextItem.status === "doing" ? <Button variant="default" size="sm" type="button" onClick={() => void updateTask(nextItem, { status: "done" })}>完成</Button> : <Button variant="soft" size="sm" type="button" onClick={() => void updateTask(nextItem, { status: "doing" })}>开始</Button>}<Button variant="ghost" size="sm" type="button" onClick={(event) => selectTask(nextItem, event.currentTarget)}>详情</Button></div></section>}
-
             <Sheet open={activeSurface === "task-detail" && Boolean(selectedTask)} onOpenChange={(open) => { if (!open) { setActiveSurface(null); setSelectedTask(null); } }}>{selectedTask && <SheetContent title="任务详情" description={`${formatDayHeading(selectedTask.date)} · ${formatMinutesOfDay(selectedTask.startMinutes)}`} returnFocusRef={surfaceTriggerRef}><section className="task-detail-card task-detail-card--sheet" aria-label="任务详情">
               <div className="panel-heading"><div><span className={`task-detail-dot ${selectedTask.tone}`} /><Input className="task-detail-title" aria-label="任务标题" value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} /></div></div>
               <div className="task-detail-meta"><span>{KIND_LABELS[selectedTask.kind]}任务</span><span>{selectedTask.project}</span><span>{formatDuration(selectedTask.durationMinutes)}</span><label className="task-detail-priority">优先级<select className="native-select" value={taskPriority} onChange={(event) => setTaskPriority(event.target.value as ScheduleTask["priority"])}><option value="low">低</option><option value="normal">普通</option><option value="high">重要</option></select></label></div>
               <div className="task-detail-reschedule"><Clock3 size={14} /><label htmlFor="task-reschedule-time">开始时间</label><input id="task-reschedule-time" className="native-input" type="time" step={900} value={rescheduleTime} onChange={(event) => setRescheduleTime(event.target.value)} /><Button variant="soft" size="sm" type="button" onClick={() => void rescheduleScheduledTask(selectedTask.taskId, timeToMinutes(rescheduleTime), selectedTask.date)}>改到此时间</Button><small>{selectedTask.kind === "fixed" ? "固定安排只能在详情中明确改时间，不能直接拖动。" : "也可以在电脑端直接拖动时间块。"}</small></div>
               <div className="task-detail-status"><span>状态</span>{(["todo", "doing", "blocked", "done"] as const).map((status) => <Button key={status} variant={selectedTask.status === status ? "soft" : "outline"} size="sm" type="button" onClick={() => updateSelectedTask({ status })}>{STATUS_LABELS[status]}</Button>)}</div>
-              <details className="task-detail-advanced"><summary>备注、提醒、重复与更多设置</summary><div className="task-reminder-policy"><label htmlFor="task-reminder-policy">QQ 提醒<select id="task-reminder-policy" className="native-select" value={taskReminderPolicy} onChange={(event) => setTaskReminderPolicy(event.target.value as ScheduleTask["reminderPolicy"])}>{Object.entries(reminderPolicyLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><small>{integrationStatus.qqConfigured ? taskReminderPolicy === "auto" ? "重要任务、固定安排和实际风险会按规则提醒。" : taskReminderPolicy === "always" ? "该任务的开始和相关日程调整都会提醒。" : "该任务自身的开始和调整不会主动提醒。" : "QQ 尚未配置；策略会保存，接入后自动生效。"}</small></div><label className="task-detail-note">进展备注<textarea value={taskNote} onChange={(event) => setTaskNote(event.target.value)} placeholder="记录这次任务的进展…" /></label>
+              <details className="task-detail-advanced"><summary>备注、提醒、重复与更多设置</summary><div className="task-reminder-policy"><label htmlFor="task-reminder-policy">主动提醒<select id="task-reminder-policy" className="native-select" value={taskReminderPolicy} onChange={(event) => setTaskReminderPolicy(event.target.value as ScheduleTask["reminderPolicy"])}>{Object.entries(reminderPolicyLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label><small>{hasReadyReminderChannel(integrationStatus) ? taskReminderPolicy === "auto" ? "重要任务、固定安排和实际风险会按规则提醒。" : taskReminderPolicy === "always" ? "该任务的开始和相关日程调整都会提醒。" : "该任务自身的开始和调整不会主动提醒。" : "当前选中的提醒通道尚未配置；策略会保存，接入后自动生效。"}</small></div><label className="task-detail-note">进展备注<textarea value={taskNote} onChange={(event) => setTaskNote(event.target.value)} placeholder="记录这次任务的进展…" /></label>
               <div className="task-detail-recurrence">
                 <div className="task-detail-recurrence__heading"><strong>重复安排</strong><span>{recurrences.length ? "单次例外不会修改整条规则" : "让基础任务按周期生成实例"}</span></div>
                 {recurrences.map((recurrence) => <div className="recurrence-row" key={recurrence.id}><span>{recurrenceFrequencyLabels[recurrence.frequency]} · {recurrence.startDate}{recurrence.endDate ? ` 至 ${recurrence.endDate}` : " 起"}</span><Button variant="ghost" size="icon" type="button" aria-label="删除重复规则" onClick={() => void deleteRecurrence(recurrence.id)}><X size={13} /></Button></div>)}
@@ -1121,17 +1278,14 @@ export function ScheduleDashboard() {
               </div><div className="task-detail-actions"><Button variant="outline" size="sm" type="button" onClick={() => updateSelectedTask({ title: taskTitle.trim(), priority: taskPriority, reminderPolicy: taskReminderPolicy, notes: taskNote })}>保存任务信息</Button><Button className="danger-button" variant="outline" size="sm" type="button" onClick={deleteSelectedTask}>删除任务</Button></div></details>
             </section></SheetContent>}</Sheet>
 
-            {scheduleStats.taskCount > 0 && <section className="summary-strip" aria-label="所选日期摘要"><span><strong>{scheduleStats.doneCount}/{scheduleStats.taskCount}</strong> 已完成</span><span><strong>{formatHours(scheduleStats.scheduledMinutes)}</strong> 已安排</span>{scheduleStats.riskCount > 0 && <button type="button" className="summary-strip__risk" onClick={(event) => openSurface(unplannedTasks.length ? "unplanned" : "activity", event.currentTarget)}>{scheduleStats.riskCount} 项需处理</button>}</section>}
-
-            {unplannedTasks.length > 0 && <section className="unplanned-entry" aria-label={`${unplannedTasks.length} 项待安排`}><div><strong>待安排 {unplannedTasks.length} 项</strong><small>{unplannedTasks[0]?.title}{unplannedTasks.length > 1 ? ` 等 ${unplannedTasks.length} 项` : ""}</small></div><Button variant="soft" size="sm" type="button" onClick={(event) => openSurface("unplanned", event.currentTarget)}>处理</Button></section>}
+            {unplannedTasks.length > 0 && <section className="unplanned-entry" aria-label={`${unplannedTasks.length} 项待安排`}><div className="unplanned-entry__summary"><strong>待安排 {unplannedTasks.length} 项</strong><small>{unplannedTasks[0]?.title}{unplannedTasks.length > 1 ? ` 等 ${unplannedTasks.length} 项` : ""}</small></div><div className="unplanned-entry__drag-list" aria-label="可拖动的待安排任务">{unplannedTasks.slice(0, 3).map((task) => <button className="unplanned-drag-chip" draggable key={task.id} type="button" aria-label={`拖动待安排任务：${task.title}`} title={`${task.title} · ${formatDuration(task.estimatedMinutes)}`} onDragStart={(event) => { event.dataTransfer.setData("application/x-goalset-task", task.id); event.dataTransfer.setData("application/x-goalset-duration", String(task.estimatedMinutes)); event.dataTransfer.effectAllowed = "move"; }} onClick={(event) => openSurface("unplanned", event.currentTarget)}><GripVertical size={13} aria-hidden="true" /><span>{task.title}</span><small>{formatDuration(task.estimatedMinutes)}</small></button>)}</div><Button variant="soft" size="sm" type="button" onClick={(event) => openSurface("unplanned", event.currentTarget)}>处理</Button></section>}
 
             <section className="calendar-card">
               <div className="calendar-card__header">
-                <div><strong>{view === "week" ? formatWeekHeading(selectedDate) : formatDayHeading(selectedDate)}</strong><span>{dataSource === "loading" ? "正在同步日程" : view === "week" ? "选择一天，下方查看完整时间轴" : `${visibleItems.length} 个安排 · ${scheduleStats.freeMinutes === null ? "可用空档计算中" : `${formatHours(scheduleStats.freeMinutes)} 可用空档`}`}</span></div>
+                <div><strong>{view === "week" ? formatWeekHeading(selectedDate) : formatDayHeading(selectedDate)}</strong><span>{dataSource === "loading" ? "正在同步日程" : view === "week" ? `${Object.values(visibleWeekSchedule ?? {}).flat().length} 个安排 · 拖动可跨日改期` : `${visibleItems.length} 个安排 · ${scheduleStats.freeMinutes === null ? "可用空档计算中" : `${formatHours(scheduleStats.freeMinutes)} 可用空档`}`}</span></div>
                 <div className="calendar-actions"><Button variant="ghost" size="icon" type="button" aria-label={view === "week" ? "上一周" : "前一天"} onClick={() => moveDate(view === "week" ? -7 : -1)}><ChevronLeft size={15} /></Button><Button variant="ghost" size="icon" type="button" aria-label={view === "week" ? "下一周" : "后一天"} onClick={() => moveDate(view === "week" ? 7 : 1)}><ChevronRight size={15} /></Button><label className="calendar-date-picker"><CalendarDays size={14} aria-hidden="true" /><span className="sr-only">选择日期</span><input aria-label="选择日期" type="date" value={selectedDate} onChange={(event) => selectDate(event.target.value)} /></label><Button className="today-button" variant="outline" size="sm" type="button" onClick={() => selectDate(todayDateKey(), "已回到今天")}>今天</Button><DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon" type="button" aria-label="更多日程操作"><MoreHorizontal size={16} /></Button></DropdownMenuTrigger><DropdownMenuContent>{selectedDate === todayDateKey() && closeableCount > 0 && <><DropdownMenuLabel>今日收尾</DropdownMenuLabel><DropdownMenuItem disabled={batchBusy} onSelect={() => requestConfirmation({ kind: "daily-close", action: "move_tomorrow", count: closeableCount }, document.querySelector('button[aria-label="更多日程操作"]'))}>移到明天待安排</DropdownMenuItem><DropdownMenuItem disabled={batchBusy} onSelect={() => requestConfirmation({ kind: "daily-close", action: "unplan", count: closeableCount }, document.querySelector('button[aria-label="更多日程操作"]'))}>留在今日待安排</DropdownMenuItem><DropdownMenuSeparator /></>}<DropdownMenuItem onSelect={() => openSurface("activity", document.querySelector('button[aria-label="活动记录"]'))}><History size={14} />活动与风险</DropdownMenuItem></DropdownMenuContent></DropdownMenu></div>
               </div>
-              {view === "week" && <><WeekView selectedDate={selectedDate} days={weekSchedule} onSelectDay={selectWeekDay} /><div className="selected-day-heading"><strong>{formatDayHeading(selectedDate)}</strong><span>{visibleItems.length} 个安排</span></div></>}
-              <DayView dateKey={selectedDate} range={timelineRange} items={visibleItems} conflict={conflictMarker} onSelect={selectTask} onDropTask={(taskId, startMinutes) => void scheduleUnplannedTask(taskId, "rules", startMinutes)} onDropScheduledTask={(taskId, startMinutes) => void rescheduleScheduledTask(taskId, startMinutes)} />
+              {view === "week" ? <WeekView selectedDate={selectedDate} range={weekTimelineRange} days={visibleWeekSchedule} conflict={conflictMarker} currentMinutes={currentMinutes} onSelectDay={selectWeekDay} onSelect={selectTask} onDropTask={(taskId, dateKey, startMinutes) => void scheduleUnplannedTask(taskId, "rules", startMinutes, false, dateKey)} onDropScheduledTask={(taskId, dateKey, startMinutes) => void rescheduleScheduledTask(taskId, startMinutes, dateKey)} /> : <DayView dateKey={selectedDate} range={timelineRange} items={visibleItems} conflict={conflictMarker} currentMinutes={currentMinutes} onSelect={selectTask} onDropTask={(taskId, startMinutes) => void scheduleUnplannedTask(taskId, "rules", startMinutes)} onDropScheduledTask={(taskId, startMinutes) => void rescheduleScheduledTask(taskId, startMinutes)} />}
               <div className="calendar-card__footer"><span><i className="legend-dot legend-dot--fixed" /> 固定安排</span><span><i className="legend-dot legend-dot--flexible" /> 弹性任务</span><span><i className="legend-dot legend-dot--floating" /> 浮动任务</span>{dataSource !== "api" && <small>{dataSource === "loading" ? "正在同步数据" : "数据暂时不可用 · 显示演示内容"}</small>}</div>
             </section>
           </div>

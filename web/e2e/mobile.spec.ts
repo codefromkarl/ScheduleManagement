@@ -15,6 +15,14 @@ test("mobile dashboard stays operable without horizontal overflow", async ({ pag
   await expect(page.getByRole("button", { name: "日", exact: true })).toHaveClass(/view-switcher__active/);
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
   expect(overflow).toBe(false);
+  await page.getByRole("button", { name: "个人菜单" }).click();
+  await page.getByRole("menuitem", { name: "账号设置" }).click();
+  await page.getByText("提醒与集成状态", { exact: true }).click();
+  await expect(page.getByText("QQ 唯一提醒通道", { exact: true })).toBeVisible();
+  await expect(page.getByText(/凭据尚未配置/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "发送 QQ 测试提醒" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "开启 PWA 提醒" })).toHaveCount(0);
+  await page.getByRole("button", { name: "关闭", exact: true }).click();
   await expect(page.getByRole("button", { name: "添加任务" })).toBeVisible();
   await page.getByRole("button", { name: "添加任务" }).click();
   await expect(page.getByRole("tab", { name: "快速填写" })).toBeVisible();

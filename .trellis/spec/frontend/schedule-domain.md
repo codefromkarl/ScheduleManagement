@@ -54,6 +54,7 @@ The current implementation lives in `web/src/features/schedule/domain/scheduler.
 - Timeline range starts from 08:00–19:00 and expands to whole hours for earlier/later availability, blackouts, blocks, or attempted conflict markers. Labels, blocks, current time, drag coordinates, and conflict positions consume the same range.
 - Capacity is a pure 15-minute-slot projection. Missing availability is `unknown`; capacity deficit or deadline risk is `impossible`; at most 60 minutes/configured-buffer margin is `tight`; otherwise it is `healthy`.
 - Cross-date unplanned grouping is relative to the Shanghai today key and emits overdue/today/tomorrow/this-week/later without mutating task dates.
+- SQLite and the no-database in-memory adapter must implement identical same-date and cross-date `scheduleTask` / `rescheduleTask` semantics: resolve the origin task/block, validate against the target snapshot, move task identity/date plus placement, and restore the origin through undo.
 
 ## 4. Validation & Error Matrix
 
@@ -70,6 +71,7 @@ The current implementation lives in `web/src/features/schedule/domain/scheduler.
 | Existing unplanned task is scheduled with `rules` but no `startMinutes` | Reject the request as invalid; manual placement must name an exact time. |
 | Same-project block metadata is present in `optimize` mode | Prefer the nearest safe contiguous slot after hard constraints and buffer checks. |
 | Normal `rules` mode has no preferred time | Preserve chronological ordering regardless of priority or project metadata. |
+| Existing task is placed/rescheduled to another date | Remove origin placement/task projection, insert target task/block, and record enough origin/target state for undo; adapters must not search only the target date. |
 
 ## 5. Good / Base / Bad Cases
 
@@ -78,6 +80,7 @@ The current implementation lives in `web/src/features/schedule/domain/scheduler.
 - Base: a task with no preferred start scans available slots in chronological order.
 - Bad: ordinary task creation silently upgrades itself to optimization and moves elastic blocks because the user mentioned a deadline.
 - Bad: a soft scoring preference overrides a fixed block/deadline, or a project ID is inferred from display text instead of the shared task/block contract.
+- Bad: the in-memory fallback returns `needs_information` for a valid cross-date move that SQLite accepts because it searches only the target snapshot for the source block.
 
 ## 6. Tests Required
 
@@ -96,6 +99,7 @@ The scheduler test suite must assert:
 - rules-mode insertion never moves an existing elastic task and persists `no_slot` work as task-without-block;
 - explicit optimize mode may return deterministic moves but does not apply them before confirmation;
 - manual unplanned placement validates the requested 15-minute start and preserves the task identity.
+- both SQLite and in-memory adapters move scheduled and unplanned tasks across dates, remove origin state, and undo back to the original task date/block.
 - batch arrange and daily close restore the complete prior block/date state through one undo.
 - dynamic ranges include early/late boundaries, capacity statuses expose exact minutes, and cross-date groups remain calendar-stable.
 

@@ -63,11 +63,12 @@ export const scheduleCommandSchema = z.object({ task: scheduleTaskSchema });
 export const reminderSummarySchema = z.object({
   id: z.string().min(1),
   taskId: z.string().nullable().optional(),
-  kind: z.enum(["start", "schedule_change", "daily_summary"]),
+  kind: z.enum(["start", "schedule_change", "daily_summary", "test"]),
   channel: z.enum(["qq", "pwa"]),
   importanceReasons: z.array(z.enum(REMINDER_IMPORTANCE_REASONS)).nullable().optional(),
   scheduledAt: z.string(),
   status: z.enum(["pending", "sending", "sent", "failed", "cancelled"]),
+  receivedAt: z.string().nullable().optional(),
   error: z.string().nullable().optional(),
 });
 

@@ -21,6 +21,8 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | Initial |
 | [Schedule API Contracts](./api-contracts.md) | Schedule snapshot and command API boundaries | Initial |
 | [Important Reminder Policy](./reminder-policy.md) | Task overrides, conditional summaries, outbox reasons, and channel boundary | Active |
+| [Private HTTPS Deployment](./deployment-contract.md) | Cloudflare Tunnel, authentication, health, secrets, and production smoke contracts | Active |
+| [Reminder Delivery and Thin IM Gateways](./delivery-gateways.md) | PWA provider/receipt evidence and isolated AstrBot transport boundary | Active |
 
 ---
 

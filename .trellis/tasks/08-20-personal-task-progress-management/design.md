@@ -141,15 +141,23 @@ Ordinary chat messages do not authorize reordering. AI reordering is entered onl
 
 Use the official QQ Bot application model rather than personal-account automation. The first version should bind one allowlisted QQ identity to the user's account and ignore or reject other senders. Normalize incoming C2C messages into the same command envelope used by website chat.
 
-The QQ adapter must handle message IDs, duplicate delivery, sender authorization, rate limits, retries, and concise replies. Detailed change previews should link to the private Web app when text is too long. QQ will be the primary channel for important reminders, but channel enablement must remain separate from reminder-importance policy so ordinary low-risk state changes are not sent indiscriminately.
+Initial owner discovery uses a supervised ten-minute pairing process with an exact random six-digit C2C command. A wrong code or non-C2C message has no effect, and an existing owner cannot be silently replaced. After discovery, the production worker returns to exact `senderId === QQBOT_OWNER_USER_ID` authorization.
+
+QQ is a thin Goalset channel: morning/task reminders flow out, and sudden-task commands flow in. A direct QQ SDK adapter, QR connector, or isolated AstrBot gateway may own transport, but none may run a second task scheduler, persist a competing task model, or let its own Agent bypass Goalset confirmation and ChangeSet rules.
+
+The QQ adapter must handle message IDs, duplicate delivery, sender authorization, rate limits, retries, and concise replies. Detailed change previews should link to the private Web app when text is too long. The user has selected QQ as the only active reminder and sudden-task channel; channel enablement remains separate from reminder-importance policy so ordinary low-risk state changes are not sent indiscriminately.
+
+Channel-level receipt and help phrases are reserved before natural-language task parsing. This prevents delivery acceptance messages from becoming incomplete tasks while keeping near-match task sentences available to the normal command service. Delayed transport acceptance uses the same reminder outbox with a future `scheduledAt`, not an adapter-local timer.
 
 QQ reordering requires a strict command prefix: “优化日程” or “AI 重排”. Messages without one of these prefixes remain ordinary task commands and may use only no-move deterministic placement.
 
 The exact QQ transport (long-lived connection or webhook), private-message intent, sandbox workflow, and account eligibility remain a feasibility gate. The adapter boundary must permit either transport without changing the scheduling domain.
 
+Do not treat connector documentation or an accepted API request as proactive-delivery proof. The QQ-only choice deliberately has no fallback until a real scheduled message arrives outside the passive-reply window and still arrives exactly once across worker restart. Settings must expose this unverified state rather than claiming reliable delivery.
+
 ### PWA notifications
 
-PWA notification is optional per user and secondary to QQ. It consumes the same reminder events and deduplication keys. Browser permission denial or service-worker failure must not affect task state.
+PWA notification support remains implemented but is not selected for the current rollout. `REMINDER_CHANNELS=qq` prevents new PWA outbox rows, the PWA worker stays stopped, and no Tailscale Serve deployment is required. If the user later re-enables PWA, browser permission denial or service-worker failure must still remain independent from task state and the existing provider-versus-device receipt evidence remains required.
 
 ### Reminder importance policy
 
@@ -168,7 +176,9 @@ The field belongs to the task domain and typed task API, not the QQ adapter. The
 
 ## Frontend Information Architecture
 
-- Dashboard: desktop defaults to a week-planning workspace that uses the wide viewport for the weekly schedule plus actionable unplanned/capacity/risk context. Mobile defaults to a today-execution workspace with the current date, next action, and day timeline first. Both can switch day/week modes without changing schedule data.
+- Dashboard: desktop defaults to a week-planning workspace with a shared vertical time scale and seven real day columns (Monday through Sunday), plus actionable unplanned/capacity/risk context. Week mode renders each task at its actual day/time and supports task detail plus validated cross-day drag/drop; it is not a date selector followed by a single-day timeline. Mobile defaults to a today-execution workspace with the current date and day timeline first. Both can switch day/week modes without changing schedule data.
+- Dashboard density: omit the separate next-task card and completed/scheduled summary strip. The timetable, compact unplanned entry, calendar free-capacity copy, and activity/risk Sheet remain the truthful sources for those decisions.
+- Weekly block hierarchy: the persistent block surface shows title plus explicit start–end time at a readable size. Existing kind colors/borders remain the compact semantic cue; full title, kind, status, project, and duration move to an accessible hover/focus disclosure and the existing task-detail Sheet. This is a presentation-only projection and does not alter `ScheduleItem`, scheduling, drag payloads, or API contracts.
 - Mobile date navigation: day mode always exposes previous day, next day, and explicit date selection as touch targets. Selecting another date preserves day mode unless the user explicitly switches to week mode.
 - Unplanned tray: a compact Dashboard section above the timeline, hidden when empty, showing three priority/deadline-ranked tasks by default with expand, exact-time, and explicit AI-optimization actions.
 - AI chat: command entry, parsed intent, candidate plans, confirmation, and undo.
@@ -181,7 +191,11 @@ The responsive layout should keep the selected date, calendar, and one primary a
 
 Desktop unplanned cards may use native drag-and-drop onto the day timeline. The drop coordinate is converted to a 15-minute-aligned exact start and sent through the same typed reschedule/place command as the accessible click-to-select-time path. Mobile and keyboard users must be able to complete the same placement without dragging. Invalid drops never choose a different slot implicitly and leave the task unplanned.
 
+The draggable unplanned source lives in the compact Dashboard entry, outside modal focus/overlay layers. It exposes the highest-ranked three tasks without adding another full list; the Sheet owns the complete list and non-drag actions. Drag payloads carry task identity plus duration so the timeline can render a start–end ghost, but only the existing `scheduleTask` command can persist a block.
+
 Scheduled flexible/floating blocks use the existing exact reschedule command for drag and click placement; fixed blocks expose click-to-edit only and do not set a drag payload. A rejected exact target preserves the original block and returns enough proposal data for the Dashboard to render a temporary red conflict marker at the attempted time.
+
+Conflict feedback is a narrow attempted-time marker rather than a replacement card, keeping the actual blocker visible. SQLite and the no-database in-memory adapter both resolve the task/block from its origin date before validating the target snapshot, then remove origin placement and insert target placement atomically within their respective adapter semantics.
 
 Batch rules scheduling is a store-owned transaction: derive unplanned tasks from one snapshot, sort by priority/deadline/title, simulate rules-only placement against a growing working block set, insert successful blocks/reminders in one transaction, and record one reversible ChangeSet. Daily close is also transactional and applies only to incomplete non-fixed tasks; it removes their blocks and optionally changes their date to tomorrow while retaining task identity.
 
@@ -204,6 +218,35 @@ Use mature accessible primitives instead of hand-implementing common interaction
 
 The schedule timeline, AI change preview, conflict proposal, and project progress visualizations remain feature components. They may use CSS grid and domain-specific layout code because their behavior depends on the fixed/flexible/floating task contract. They must still compose the shared Button, Badge, Dialog, Input, Tabs, and Toast components instead of recreating those primitives.
 
+## Password Owner Authentication
+
+The latest user decision supersedes the proposed Google OAuth migration. Goalset keeps the existing single-owner password flow and introduces no user registration, OAuth identity, account switching, or per-user data ownership.
+
+- `AUTH_DISABLED=false` remains mandatory for the public Cloudflare Tunnel deployment.
+- `OWNER_PASSWORD` and `AUTH_SECRET` stay only in ignored `.env.local`; their values must never enter code, task artifacts, logs, screenshots, or Git.
+- A successful password check issues the existing HTTP-only owner JWT for the `personal` workspace. Anonymous pages redirect to `/login`, while anonymous protected APIs return `401`.
+- Password changes require recreating the app container. Existing sessions remain valid unless `AUTH_SECRET` is also rotated; this password-only change intentionally preserves current sessions.
+- The user-selected password is accepted as an explicit deployment choice even though it is weak. The safe follow-up is password rotation, not disabling authentication or weakening cookie/API protections.
+
+## One-off and Recurring Task Creation
+
+One-off versus recurring is not a second task-kind enum. A task with no recurrence rule is one-off; a task referenced by one validated recurrence rule is recurring. `fixed / flexible / floating` remains the independent scheduling constraint.
+
+- Define one shared recurrence draft contract: `frequency`, optional `weekdays`, `startDate`, optional `endDate`, and `timezone`.
+- Extend the normal schedule-create command with optional `recurrence`. The SQLite store writes the template task, initial block or unplanned state, recurrence rule, change set, and eligible reminders in one transaction. Existing callers that omit `recurrence` remain one-off and backward compatible.
+- Manual creation defaults to “一次性”. Selecting “周期” reveals only the existing four frequencies: daily, workday, weekly, and selected weekdays, plus optional end date. The submit button itself is the user confirmation.
+- Existing task-detail recurrence editing, single-occurrence skip/move/override, and lazy materialization remain the sole recurrence engine and exception model.
+
+The natural-language plan adds a nullable recurrence draft plus a decision of `one_off`, `recurring`, or `uncertain`:
+
+1. Deterministic parsing handles explicit Chinese recurrence phrases and emits a validated recurring draft.
+2. Ambiguous phrases are sent to the configured cloud provider; without a working provider they return one concise clarification.
+3. A recurring plan never writes immediately. The API returns a `recurrence_preview` containing normalized task and recurrence fields.
+4. The Dashboard displays frequency, weekdays, start/end dates, start/deadline, and duration. Only explicit confirmation posts the shared schedule-create command.
+5. The server revalidates the confirmed payload and uses rule scheduling mode for the first occurrence; recurrence confirmation does not implicitly authorize moving existing tasks.
+
+Invalid combinations are rejected before mutation: selected-weekday frequency without weekdays, end before start, unsupported monthly/custom frequencies, fixed tasks without exact start time, non-15-minute duration/time, or a recurrence range that cannot include its start occurrence.
+
 ## Persistence and Deployment
 
 Recommended initial technical shape:
@@ -213,6 +256,8 @@ Recommended initial technical shape:
 - A small Node worker for reminder dispatch, retries, recurrence materialization, and QQ connection lifecycle.
 - A provider interface for cloud AI first, with secrets kept server-side.
 - Docker Compose with a reverse proxy/HTTPS layer, private authentication, encrypted environment secrets, and scheduled database backups.
+
+The production-shaped personal-host deployment uses a dedicated Cloudflare Tunnel for `goalset.codefromkarl.xyz`, leaving the Firefly root domain unchanged. `cloudflared` runs beside the Compose app with host networking, a narrowly mounted ignored credential, and the same host UID/GID that owns the credential. The Tunnel must stay stopped until `AUTH_DISABLED=false`, the app is healthy, and an online SQLite backup exists.
 
 The application should be a single-user private service, but the data model can keep an explicit user/account boundary so QQ identity binding and future authentication do not leak into every domain table.
 
@@ -229,7 +274,7 @@ The application should be a single-user private service, but the data model can 
 - Verify an official QQ Bot account can receive and reply to the intended C2C private messages in the available environment.
 - Verify the permitted intent, sandbox/production flow, rate limits, message formats, and credential lifecycle.
 - Verify the selected server can maintain the required connection or receive the required callback securely.
-- Verify PWA notification support on the target mobile browser before treating it as more than an optional channel.
+- Defer PWA phone/browser acceptance and Tailscale Serve unless the user explicitly re-enables PWA reminders.
 
 ## Current Local Slice
 
@@ -237,4 +282,4 @@ The local implementation follows this design without introducing a second compon
 
 Recurring instances use `<templateTaskId>@<date>` task identities and are materialized lazily when a date is read. A materialized occurrence is scheduled through the same scheduler; an unavailable slot remains an unplanned task instead of being silently dropped. Updating an occurrence changes only that occurrence, while deleting the parent rule removes generated instances and their outbox rows.
 
-The remaining external gates are intentionally isolated from the core: valid cloud AI credentials, official QQ C2C account/intent/sandbox access, and a real browser push subscription. The application remains usable through manual scheduling and website AI when any channel is unavailable.
+The remaining external gates are intentionally isolated from the core: valid cloud AI credentials and official QQ C2C account/intent/sandbox access. A real browser push subscription is deferred while QQ-only mode is selected. The application remains usable through manual scheduling and website AI when the QQ channel is unavailable.

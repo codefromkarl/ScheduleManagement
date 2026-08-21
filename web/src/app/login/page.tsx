@@ -47,7 +47,7 @@ export default function LoginPage() {
           {error && <div className="login-error" role="alert">{error}</div>}
           <Button className="login-submit" type="submit" disabled={pending}>{pending ? "验证中…" : "进入日程"}</Button>
         </form>
-        <small>本地开发默认密码为 `goalset-local`，公网部署前请修改。</small>
+        <small>访问密码由当前部署环境配置。</small>
       </section>
     </main>
   );

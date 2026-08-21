@@ -22,6 +22,13 @@
       "when": 1787285816129,
       "tag": "0002_confused_scourge",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1787288356257,
+      "tag": "0003_elite_vapor",
+      "breakpoints": true
     }
   ]
 }

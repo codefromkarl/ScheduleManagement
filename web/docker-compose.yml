@@ -16,7 +16,7 @@ services:
       - "3000:3000"
     command: ["sh", "-c", "./node_modules/.bin/drizzle-kit migrate && ./node_modules/.bin/next start"]
     healthcheck:
-      test: ["CMD-SHELL", "test -w /data && test -w /data/goalset.db && node -e \"fetch('http://127.0.0.1:3000/api/status').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      test: ["CMD-SHELL", "test -w /data && test -w /data/goalset.db && node -e \"fetch('http://127.0.0.1:3000/login').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -58,3 +58,16 @@ services:
       goalset-app:
         condition: service_healthy
     command: ["./node_modules/.bin/tsx", "src/server/pwa-worker.mts"]
+
+  goalset-tunnel:
+    image: cloudflare/cloudflared:2026.8.2
+    container_name: goalset-tunnel
+    user: "${GOALSET_UID:-1001}:${GOALSET_GID:-1001}"
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      goalset-app:
+        condition: service_healthy
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+    command: ["tunnel", "--config", "/etc/cloudflared/config.yml", "run"]

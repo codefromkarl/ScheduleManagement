@@ -1,4 +1,4 @@
-import { access, mkdir } from "node:fs/promises";
+import { access, chmod, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createClient } from "@libsql/client/node";
 import { config } from "dotenv";
@@ -24,6 +24,7 @@ const client = createClient({ url: databaseUrl });
 try {
   await client.execute("PRAGMA wal_checkpoint(PASSIVE)");
   await client.execute(`VACUUM INTO '${outputPath.replaceAll("'", "''")}'`);
+  await chmod(outputPath, 0o600);
   const backupClient = createClient({ url: `file:${outputPath}` });
   try {
     const result = await backupClient.execute("PRAGMA quick_check");

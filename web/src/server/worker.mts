@@ -6,8 +6,8 @@ import { getActiveScheduleStore } from "@/features/schedule/data/active-store";
 import type { ScheduleTask } from "@/features/schedule/domain/types";
 import { evaluateDailySummary } from "@/features/schedule/domain/reminder-policy";
 import { parseScheduleCommand } from "@/server/ai/provider";
-import { qqConfigError, qqIsConfigured } from "@/server/qq/config";
-import { parseQqCommandMode } from "@/server/qq/command-mode";
+import { qqConfigError, qqIsConfigured, reminderChannelIsEnabled, sanitizedQqError } from "@/server/qq/config";
+import { parseQqCommandMode, parseQqControlCommand } from "@/server/qq/command-mode";
 import { getDb } from "@/server/db";
 import { commandReceipts, reminders } from "@/server/db/schema";
 import { dailySummaryTime, reminderMessage, REMINDER_WORKSPACE_ID, todayInShanghai } from "@/server/reminders";
@@ -34,15 +34,15 @@ async function dispatchReminders(bot: QQBot) {
       const [claimed] = await db.update(reminders).set({ status: "sending", updatedAt: new Date() }).where(and(eq(reminders.id, reminder.id), eq(reminders.status, "pending"))).returning({ id: reminders.id });
       if (!claimed) continue;
       try {
-        await bot.sendText({ scope: "c2c", targetId: process.env.QQBOT_OWNER_USER_ID! }, reminderMessage(reminder.kind, reminder.taskId, reminder.importanceReasons ?? []));
+        await bot.sendText({ scope: "c2c", targetId: process.env.QQBOT_OWNER_USER_ID! }, reminderMessage(reminder.kind, reminder.taskId, reminder.importanceReasons ?? [], "qq"));
         await db.update(reminders).set({ status: "sent", sentAt: new Date(), updatedAt: new Date() }).where(eq(reminders.id, reminder.id));
       } catch (error) {
-        await db.update(reminders).set({ status: "failed", error: error instanceof Error ? error.message : "unknown error", updatedAt: new Date() }).where(eq(reminders.id, reminder.id));
+        await db.update(reminders).set({ status: "failed", error: sanitizedQqError(error), updatedAt: new Date() }).where(eq(reminders.id, reminder.id));
       }
     }
     await recordWorkerHealth("qq", "success").catch(() => undefined);
   } catch (error) {
-    await recordWorkerHealth("qq", "error", error instanceof Error ? error.message : "unknown error").catch(() => undefined);
+    await recordWorkerHealth("qq", "error", sanitizedQqError(error)).catch(() => undefined);
     throw error;
   }
 }
@@ -67,7 +67,10 @@ async function updateReceipt(id: string, status: "pending_confirmation" | "proce
   await getDb().update(commandReceipts).set({ status, responseText, ...(payload ? { payload } : {}), updatedAt: new Date() }).where(eq(commandReceipts.id, id));
 }
 
-if (!qqIsConfigured()) {
+if (!reminderChannelIsEnabled("qq")) {
+  console.error("[goalset-worker] QQ reminder channel is disabled by REMINDER_CHANNELS");
+  process.exitCode = 1;
+} else if (!qqIsConfigured()) {
   console.error(`[goalset-worker] ${qqConfigError()}`);
   process.exitCode = 1;
 } else {
@@ -77,16 +80,16 @@ if (!qqIsConfigured()) {
     accountId: "goalset-personal",
     tokenPrefetch: "sync",
     logger: {
-      debug: (message) => console.debug("[qq]", message),
+      debug: () => undefined,
       info: (message) => console.info("[qq]", message),
       warn: (message) => console.warn("[qq]", message),
-      error: (message) => console.error("[qq]", message),
+      error: (message) => console.error("[qq]", sanitizedQqError(message)),
     },
   });
   const pendingTasks = new Map<string, PendingCommand>();
 
   bot.on("ready", () => { console.info("[goalset-worker] QQ Bot ready"); void recordWorkerHealth("qq", "running"); });
-  bot.on("error", (error) => { console.error("[goalset-worker] QQ Bot error", error.message); void recordWorkerHealth("qq", "error", error.message); });
+  bot.on("error", (error) => { const message = sanitizedQqError(error); console.error("[goalset-worker] QQ Bot error", message); void recordWorkerHealth("qq", "error", message); });
   bot.on("message", async (_context, message) => {
     if (message.kind !== "c2c" || message.senderId !== process.env.QQBOT_OWNER_USER_ID) return;
     const receipt = await claimCommand(String(message.messageId), String(message.senderId));
@@ -94,9 +97,15 @@ if (!qqIsConfigured()) {
     const date = todayInShanghai();
     const store = getActiveScheduleStore();
     const text = message.content.trim();
+    const controlCommand = parseQqControlCommand(text);
     const { optimize, commandText } = parseQqCommandMode(text);
 
     try {
+      if (controlCommand) {
+        await bot.sendText(message.replyTarget, controlCommand.reply);
+        await updateReceipt(receipt.id, "processed", controlCommand.reply, { kind: controlCommand.kind });
+        return;
+      }
       if (text === "确认") {
         const pendingRecord = await pendingConfirmation(String(message.senderId));
         const previousCommand = pendingRecord.command ?? pendingTasks.get(String(message.senderId));
@@ -185,7 +194,7 @@ if (!qqIsConfigured()) {
         await updateReceipt(receipt.id, "processed", responseText);
       }
     } catch (error) {
-      console.error("[goalset-worker] command failed", error instanceof Error ? error.message : error);
+      console.error("[goalset-worker] command failed", sanitizedQqError(error));
       const responseText = "处理失败，原日程没有改变。";
       await updateReceipt(receipt.id, "failed", responseText);
       await bot.sendText(message.replyTarget, responseText);
@@ -199,7 +208,7 @@ if (!qqIsConfigured()) {
   process.once("SIGTERM", () => { clearInterval(reminderTimer); abort.abort(); });
   void dispatchReminders(bot);
   bot.start(abort.signal).catch((error) => {
-    console.error("[goalset-worker] stopped with error", error);
+    console.error("[goalset-worker] stopped with error", sanitizedQqError(error));
     process.exitCode = 1;
   });
 }

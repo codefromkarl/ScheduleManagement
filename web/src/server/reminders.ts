@@ -1,15 +1,12 @@
-import { pwaIsConfigured, qqIsConfigured } from "@/server/qq/config";
+import { pwaIsConfigured, qqIsConfigured, selectedReminderChannels } from "@/server/qq/config";
 import type { ReminderImportanceReason } from "@/features/schedule/domain/reminder-policy";
 
 export const REMINDER_WORKSPACE_ID = "personal";
 export type ReminderChannel = "qq" | "pwa";
-export type ReminderKind = "start" | "schedule_change" | "daily_summary";
+export type ReminderKind = "start" | "schedule_change" | "daily_summary" | "test";
 
 export function configuredReminderChannels(): ReminderChannel[] {
-  return [
-    ...(qqIsConfigured() ? ["qq" as const] : []),
-    ...(pwaIsConfigured() ? ["pwa" as const] : []),
-  ];
+  return selectedReminderChannels().filter((channel) => channel === "qq" ? qqIsConfigured() : pwaIsConfigured());
 }
 
 export function todayInShanghai() {
@@ -35,8 +32,9 @@ export function reminderReasonText(reasons: ReminderImportanceReason[]) {
   return reasons.map((reason) => importanceLabels[reason]).join("、");
 }
 
-export function reminderMessage(kind: ReminderKind, taskId?: string | null, reasons: ReminderImportanceReason[] = []) {
+export function reminderMessage(kind: ReminderKind, taskId?: string | null, reasons: ReminderImportanceReason[] = [], channel: ReminderChannel = "qq") {
   const reason = reminderReasonText(reasons);
+  if (kind === "test") return channel === "qq" ? "Goalset QQ 测试提醒：提醒通道已成功发送消息。" : "Goalset 测试提醒：设备已成功接收 Web Push。";
   if (kind === "start") return `重要提醒：任务即将开始（${taskId ?? "未命名任务"}）${reason ? ` · ${reason}` : ""}`;
   if (kind === "schedule_change") return `重要提醒：你的日程刚刚发生调整${reason ? `（${reason}）` : ""}，请打开 goalset 查看受影响的任务。`;
   return `今日风险摘要${reason ? `：${reason}` : ""}。请打开 goalset 查看并处理。`;

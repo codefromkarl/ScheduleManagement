@@ -17,6 +17,10 @@ function todayKey() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai" }).format(new Date());
 }
 
+function addDays(date: string, days: number) {
+  const value = new Date(`${date}T00:00:00Z`); value.setUTCDate(value.getUTCDate() + days); return value.toISOString().slice(0, 10);
+}
+
 function task(id: string, title: string, date: string, overrides: Partial<TaskInput> = {}): TaskInput {
   return { id, title, date, kind: "flexible", priority: "normal", status: "todo", estimatedMinutes: 30, movable: true, preferredStartMinutes: 9 * 60, ...overrides };
 }
@@ -31,11 +35,13 @@ async function cleanup(request: APIRequestContext, ids: string[]) {
   for (const id of ids.reverse()) await request.delete(`/api/tasks/${id}`);
 }
 
-async function dragToMinute(page: Page, title: string, startMinutes: number) {
+async function dragToMinute(page: Page, title: string, startMinutes: number, targetDate?: string, drop = true) {
   await page.locator(".schedule-item").filter({ hasText: title }).waitFor();
-  await page.evaluate(({ title: targetTitle, startMinutes: targetStart }) => {
+  await page.evaluate(({ title: targetTitle, startMinutes: targetStart, targetDate: targetDateKey, drop: shouldDrop }) => {
     const block = [...document.querySelectorAll<HTMLElement>(".schedule-item")].find((item) => item.innerText.includes(targetTitle));
-    const track = document.querySelector<HTMLElement>(".timeline-track");
+    const track = targetDateKey
+      ? document.querySelector<HTMLElement>(`.week-timetable__track[data-date="${targetDateKey}"]`)
+      : block?.closest<HTMLElement>(".week-timetable__track") ?? document.querySelector<HTMLElement>(".timeline-track");
     if (!block || !track) throw new Error("drag source or timeline missing");
     const rangeStart = Number(track.dataset.startMinutes);
     const rangeEnd = Number(track.dataset.endMinutes);
@@ -44,8 +50,8 @@ async function dragToMinute(page: Page, title: string, startMinutes: number) {
     block.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: transfer }));
     const rect = track.getBoundingClientRect();
     const clientY = rect.top + ((targetStart - rangeStart) / (rangeEnd - rangeStart)) * rect.height;
-    for (const type of ["dragenter", "dragover", "drop"]) track.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, clientY, dataTransfer: transfer }));
-  }, { title, startMinutes });
+    for (const type of shouldDrop ? ["dragenter", "dragover", "drop"] : ["dragenter", "dragover"]) track.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, clientY, dataTransfer: transfer }));
+  }, { title, startMinutes, targetDate, drop });
 }
 
 test("rules batch, scheduled drag/click, and conflict feedback stay deterministic", async ({ page, request }) => {
@@ -77,6 +83,8 @@ test("rules batch, scheduled drag/click, and conflict feedback stay deterministi
     await page.reload();
     await expect(page.locator(".schedule-item").filter({ hasText: "拖动改期任务" })).toBeVisible();
 
+    await dragToMinute(page, "拖动改期任务", 13 * 60 + 8, undefined, false);
+    await expect(page.getByRole("status", { name: "目标时间 13:15–13:45" })).toBeVisible();
     await dragToMinute(page, "拖动改期任务", 13 * 60);
     await expect(page.getByText("任务已改到 13:00", { exact: true })).toBeVisible();
     await dragToMinute(page, "拖动改期任务", 12 * 60);
@@ -92,6 +100,11 @@ test("rules batch, scheduled drag/click, and conflict feedback stay deterministi
 
     const optimizeDateValue = new Date(`${date}T00:00:00Z`); optimizeDateValue.setUTCDate(optimizeDateValue.getUTCDate() + 1);
     const optimizeDate = optimizeDateValue.toISOString().slice(0, 10);
+    await dragToMinute(page, "拖动改期任务", 17 * 60, optimizeDate);
+    await expect(page.getByText("任务已改到 17:00", { exact: true })).toBeVisible();
+    const crossDaySnapshot = await request.get(`/api/schedule?date=${optimizeDate}`).then((response) => response.json());
+    expect(crossDaySnapshot.blocks.find((block: { taskId: string }) => block.taskId === ids[2])?.startMinutes).toBe(17 * 60);
+
     await createTask(request, task(ids[4], "优化预览阻挡", optimizeDate, { preferredStartMinutes: 9 * 60, estimatedMinutes: 60 }));
     const optimizePending = await createTask(request, task(ids[5], "优化预览任务", optimizeDate, { preferredStartMinutes: 9 * 60, estimatedMinutes: 60, deadlineMinutes: 10 * 60 }));
     expect(optimizePending.proposal.decision).toBe("no_slot");
@@ -102,6 +115,7 @@ test("rules batch, scheduled drag/click, and conflict feedback stay deterministi
     expect(previewBody.snapshot.blocks.find((block: { taskId: string }) => block.taskId === ids[4])?.startMinutes).toBe(9 * 60);
     expect(previewBody.snapshot.blocks.some((block: { taskId: string }) => block.taskId === ids[5])).toBe(false);
 
+    await page.reload();
     await page.locator(".week-column").filter({ hasText: optimizeDate.slice(5).replace("-", "/") }).click();
     await page.getByRole("button", { name: "处理", exact: true }).click();
     const optimizeRow = page.locator(".unplanned-row").filter({ hasText: "优化预览任务" });
@@ -111,6 +125,49 @@ test("rules batch, scheduled drag/click, and conflict feedback stay deterministi
     await page.locator(".schedule-change-preview").getByRole("button", { name: "取消", exact: true }).click();
   } finally {
     await cleanup(request, ids);
+    await request.put("/api/availability", { data: { rules: restoreRules } });
+  }
+});
+
+test("desktop compact unplanned chip reaches the weekly timetable with a real pointer drag", async ({ page, request }) => {
+  const date = todayKey();
+  const weekday = new Date(`${date}T00:00:00Z`).getUTCDay();
+  const monday = addDays(date, -((weekday + 6) % 7));
+  const targetDate = date === monday ? addDays(monday, 1) : monday;
+  const suffix = crypto.randomUUID();
+  const blockerId = `unplanned-drag-blocker-${suffix}`;
+  const taskId = `unplanned-drag-task-${suffix}`;
+  const availability = await request.get("/api/availability").then((response) => response.json());
+  const restoreRules = availability.weekly;
+  try {
+    await request.put("/api/availability", { data: { rules: Array.from({ length: 7 }, (_, day) => ({ weekday: day, startMinutes: 9 * 60, endMinutes: 18 * 60, enabled: true })) } });
+    await createTask(request, task(blockerId, "未排期拖放阻挡", date, { kind: "fixed", movable: false, estimatedMinutes: 60, preferredStartMinutes: 9 * 60 }));
+    const unplanned = await createTask(request, task(taskId, "真实鼠标拖放任务", date, { kind: "fixed", movable: false, estimatedMinutes: 30, preferredStartMinutes: 9 * 60 }));
+    expect(unplanned.proposal.decision).toBe("no_slot");
+    await request.delete(`/api/tasks/${blockerId}`);
+
+    await page.goto("/");
+    await page.getByRole("button", { name: "处理", exact: true }).click();
+    const sheetRow = page.locator(".unplanned-row").filter({ hasText: "真实鼠标拖放任务" });
+    await expect(sheetRow).not.toHaveAttribute("draggable", "true");
+    await expect(sheetRow.locator(".unplanned-row__grip")).toHaveCount(0);
+    await page.getByRole("button", { name: "关闭", exact: true }).click();
+
+    const source = page.getByRole("button", { name: "拖动待安排任务：真实鼠标拖放任务" });
+    const target = page.locator(`.week-timetable__track[data-date="${targetDate}"]`);
+    await expect(source).toHaveAttribute("draggable", "true");
+    const targetBox = await target.boundingBox();
+    expect(targetBox).not.toBeNull();
+    const rangeStart = Number(await target.getAttribute("data-start-minutes"));
+    const rangeEnd = Number(await target.getAttribute("data-end-minutes"));
+    const targetMinute = 14 * 60 + 30;
+    await source.dragTo(target, { targetPosition: { x: targetBox!.width / 2, y: ((targetMinute - rangeStart) / (rangeEnd - rangeStart)) * targetBox!.height } });
+    await expect(page.getByText("任务已布置到 14:30", { exact: true })).toBeVisible();
+    const snapshot = await request.get(`/api/schedule?date=${targetDate}`).then((response) => response.json());
+    expect(snapshot.tasks.find((item: { id: string }) => item.id === taskId)?.date).toBe(targetDate);
+    expect(snapshot.blocks.find((block: { taskId: string }) => block.taskId === taskId)?.startMinutes).toBe(targetMinute);
+  } finally {
+    await cleanup(request, [taskId, blockerId]);
     await request.put("/api/availability", { data: { rules: restoreRules } });
   }
 });
