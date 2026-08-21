@@ -1,0 +1,212 @@
+# 个人任务进度管理网站技术设计（草案）
+
+## Status
+
+Approved implementation baseline. The QQ private-message capability, account eligibility, transport mode, and sandbox rules remain a feasibility gate for the QQ adapter only.
+
+## Design Goals
+
+- Make the calendar/schedule the primary product surface.
+- Keep deterministic scheduling rules outside the language model.
+- Make deterministic, no-move placement the default; AI reordering is an explicit opt-in operation, never an implicit consequence of task creation.
+- Let website chat and QQ private messages call the same command and scheduling service.
+- Make low-risk temporary-task insertion fast, while keeping high-risk changes reviewable and reversible.
+- Work across desktop and mobile through one responsive Web/PWA client.
+- Keep the application useful when QQ, reminders, or the AI provider is unavailable.
+
+## Initial Non-Goals
+
+- Team collaboration, invitations, roles, and comments.
+- QQ Space/QQ Channel publishing or social-content operations.
+- Reading the user's complete QQ chat history.
+- Third-party calendar synchronization.
+- A complex project hierarchy, Gantt chart, resource planner, or custom workflow engine.
+- Unreviewed autonomous deletion or broad schedule rewrites.
+
+## Recommended System Shape
+
+Use a TypeScript modular monolith with a separate background worker process. The first deployment can run as a small Docker Compose stack on a private personal server or cloud VM.
+
+```text
+Desktop Web/PWA             QQ Official Bot
+       │                           │
+       └──────────────┬────────────┘
+                      ▼
+             Channel adapter layer
+                      ▼
+          Command + conversation service
+                      ▼
+       AI intent parser / tool orchestrator
+                      ▼
+       Deterministic scheduling domain core
+              │                    │
+              ▼                    ▼
+          SQLite              Change-set audit
+              │                    │
+              └──────────┬─────────┘
+                         ▼
+                Reminder/job dispatcher
+                    │             │
+                    ▼             ▼
+                QQ reply      PWA notification
+```
+
+The AI may propose an operation, but it must not write schedule rows directly. All mutations pass through typed domain commands, constraint validation, a transaction, and an auditable change set.
+
+## Domain Boundaries
+
+### Schedule and task domain
+
+- `Task`: semantic work item or commitment. It carries title, type, project, status, estimated minutes, priority, due time, notes, and source.
+- `ScheduleBlock`: a concrete placement of a task or fixed arrangement on the timeline, with start/end, origin, and whether it is movable.
+- `TaskType`: `fixed`, `flexible`, or `floating`.
+- `RecurrenceRule`: daily, weekly, workday, or selected weekdays with start/end dates.
+- `OccurrenceOverride`: a single skip, move, or override that does not mutate the parent recurrence rule.
+- `Project`: optional lightweight grouping for tasks and progress; no deep nested hierarchy in MVP.
+
+Keep the task and its placement separate. A task can be rescheduled without losing its identity, and a recurring task can produce multiple occurrences without copying unrelated metadata.
+
+### Availability and constraints
+
+- `AvailabilityRule`: weekly usable windows.
+- `UnavailableWindow`: sleep, do-not-disturb, leave, travel, or one-off unavailable periods.
+- `ScheduleConstraint`: fixed placement, hard deadline, movable flag, buffer preference, or other explicit rule.
+- Time is stored with an explicit timezone policy. The initial user timezone should be configurable rather than inferred from the server.
+
+The scheduler treats fixed arrangements, unavailable windows, and hard deadlines as hard constraints. Priority, preferred time, project continuity, and buffer are soft constraints used for scoring candidate schedules.
+
+### AI preferences
+
+Store learned preferences as visible records, not hidden prompt memory. Examples include default duration by task category, preferred deep-work windows, and normal transition buffer. Every learned preference should have a source, confidence, last-used time, and an explicit reset path.
+
+### Change sets and audit
+
+Every AI mutation creates an `AIChangeSet` containing:
+
+- original channel message and normalized command;
+- parsed fields and confidence;
+- affected tasks and schedule blocks;
+- before/after snapshots or reversible operations;
+- reason and constraint explanation;
+- confirmation state, actor, timestamps, and undo status.
+
+Undo applies the inverse change set in a new transaction; it does not rewrite history.
+
+## Scheduling Contract
+
+The scheduling core operates in 15-minute units and supports non-hour durations such as 45 minutes. A default 15-minute transition buffer is applied unless the user's preference or task rule overrides it.
+
+Candidate generation should follow this order:
+
+1. Normalize the requested task and fill only high-confidence defaults.
+2. Load the relevant date range, availability, fixed blocks, recurrence instances, projects, preferences, and current task placements.
+3. Generate available 15-minute slots that satisfy hard constraints.
+4. In normal rule mode, choose an exact requested time, otherwise the closest safe slot to an explicit preferred time, otherwise the earliest safe slot. Priority, project continuity, and fragmentation must not alter normal placement.
+5. If an empty slot exists, insert the task without moving anything.
+6. If no empty slot exists during normal task creation, preserve all existing blocks and keep the new task unplanned.
+7. Only an explicit AI-optimization command may request candidate reordering or movement of elastic tasks; the deterministic domain still validates every candidate.
+8. Any plan that moves an existing task is previewed and requires confirmation before a transaction is applied.
+9. Apply a confirmed plan transactionally, enqueue reminders, and return a concise summary plus a detailed Web link when available.
+
+AI optimization may use deadline pressure, priority, preferred hours, project continuity, and fragmentation as soft scoring inputs, but hard constraints remain deterministic and the resulting movement plan remains a proposal until confirmed.
+
+Tasks without a reliable duration or deadline should not be counted as confidently schedulable. The AI should ask for the smallest missing fact, or show an estimate for confirmation when its confidence is high.
+
+Project progress uses completed estimated minutes divided by the estimated minutes of known project tasks. Tasks without an accepted estimate are shown separately as “missing estimate” and do not silently count as zero effort. Health status is derived from overdue work, blocked tasks, and deadline feasibility.
+
+## AI Command Contract
+
+The model produces a validated structured intent, not arbitrary database operations. Initial intents include:
+
+- create or capture a task;
+- insert a temporary task;
+- reschedule or split an existing task;
+- update status or progress note;
+- set or explain a preference;
+- confirm a proposed change set;
+- undo a change set;
+- ask for the current schedule or project risk.
+
+The orchestrator should provide only the relevant context window, use schema validation, and route mutations through domain services. The website and QQ channels must share this contract.
+
+## Channel Design
+
+### Website chat
+
+The website chat is the full interaction surface. It shows parsed task fields, candidate schedule changes, affected items, and confirm/undo actions. It can link directly to the Dashboard and change history.
+
+Ordinary chat messages do not authorize reordering. AI reordering is entered only through a dedicated “AI 优化日程” action that adds an explicit optimization intent to the command envelope; task text alone must never infer this permission.
+
+### QQ private-message Bot
+
+Use the official QQ Bot application model rather than personal-account automation. The first version should bind one allowlisted QQ identity to the user's account and ignore or reject other senders. Normalize incoming C2C messages into the same command envelope used by website chat.
+
+The QQ adapter must handle message IDs, duplicate delivery, sender authorization, rate limits, retries, and concise replies. Detailed change previews should link to the private Web app when text is too long. QQ will be the primary reminder channel.
+
+QQ reordering requires a strict command prefix: “优化日程” or “AI 重排”. Messages without one of these prefixes remain ordinary task commands and may use only no-move deterministic placement.
+
+The exact QQ transport (long-lived connection or webhook), private-message intent, sandbox workflow, and account eligibility remain a feasibility gate. The adapter boundary must permit either transport without changing the scheduling domain.
+
+### PWA notifications
+
+PWA notification is optional per user and secondary to QQ. It consumes the same reminder events and deduplication keys. Browser permission denial or service-worker failure must not affect task state.
+
+## Frontend Information Architecture
+
+- Dashboard: desktop defaults to week view; mobile defaults to day view. Both switch between day and week.
+- Unplanned tray: a compact Dashboard section above the timeline, hidden when empty, showing three priority/deadline-ranked tasks by default with expand, exact-time, and explicit AI-optimization actions.
+- AI chat: command entry, parsed intent, candidate plans, confirmation, and undo.
+- Project view: tasks, weighted progress, health, blockers, and recent changes.
+- Task detail: type, placement, estimate, priority, deadline, flexibility, recurrence, notes, and audit history.
+- Settings: availability, do-not-disturb, buffer, AI preferences, notification channels, account, backup, and provider configuration.
+- Change history: searchable list of AI and manual changes with reversible recent operations.
+
+The responsive layout should keep the calendar and one primary action visible on mobile; advanced editing can open a bottom sheet or dedicated detail page.
+
+Desktop unplanned cards may use native drag-and-drop onto the day timeline. The drop coordinate is converted to a 15-minute-aligned exact start and sent through the same typed reschedule/place command as the accessible click-to-select-time path. Mobile and keyboard users must be able to complete the same placement without dragging. Invalid drops never choose a different slot implicitly and leave the task unplanned.
+
+## UI Component Strategy
+
+Use mature accessible primitives instead of hand-implementing common interaction behavior:
+
+- `shadcn/ui` as the project-owned component layer, with Radix primitives underneath for dialogs, menus, tabs, popovers, tooltips, focus management, and keyboard behavior.
+- `lucide-react` for consistent icons rather than ad-hoc Unicode symbols in production controls.
+- `React Hook Form` and `Zod` for later task/settings forms and runtime validation.
+- Keep the Goalset visual language in local theme tokens and component variants; adopting a mature primitive layer does not mean accepting a generic visual template.
+
+The schedule timeline, AI change preview, conflict proposal, and project progress visualizations remain feature components. They may use CSS grid and domain-specific layout code because their behavior depends on the fixed/flexible/floating task contract. They must still compose the shared Button, Badge, Dialog, Input, Tabs, and Toast components instead of recreating those primitives.
+
+## Persistence and Deployment
+
+Recommended initial technical shape:
+
+- TypeScript + React/Next.js for the responsive Web/PWA.
+- SQLite in WAL mode for durable tasks, recurring instances, audit records, reminders, and preferences on the single private host.
+- A small Node worker for reminder dispatch, retries, recurrence materialization, and QQ connection lifecycle.
+- A provider interface for cloud AI first, with secrets kept server-side.
+- Docker Compose with a reverse proxy/HTTPS layer, private authentication, encrypted environment secrets, and scheduled database backups.
+
+The application should be a single-user private service, but the data model can keep an explicit user/account boundary so QQ identity binding and future authentication do not leak into every domain table.
+
+## Failure and Recovery Rules
+
+- AI provider unavailable: Dashboard and manual task editing continue; AI commands show a truthful failure state.
+- QQ unavailable: Website chat and Dashboard continue; inbound messages are not silently marked processed unless the command was durably recorded.
+- Reminder failure: retry with a bounded policy and expose failure; never mark a task complete or reschedule it because a notification failed.
+- Scheduling conflict: preserve the original schedule until a plan is auto-approved or explicitly confirmed.
+- Undo: apply inverse operations with conflict checks; if later changes make a clean inverse impossible, show a recovery proposal instead of overwriting newer work.
+
+## Technical Feasibility Gates
+
+- Verify an official QQ Bot account can receive and reply to the intended C2C private messages in the available environment.
+- Verify the permitted intent, sandbox/production flow, rate limits, message formats, and credential lifecycle.
+- Verify the selected server can maintain the required connection or receive the required callback securely.
+- Verify PWA notification support on the target mobile browser before treating it as more than an optional channel.
+
+## Current Local Slice
+
+The local implementation follows this design without introducing a second component system: SQLite is the active store, the deterministic scheduler owns all placements, website/QQ commands share the structured provider boundary, and PWA/QQ reminders consume the outbox. The Web app and optional workers share one bind-mounted SQLite file with WAL, foreign keys, a bounded busy timeout, verified backup/restore, and an atomic reminder-claim test. The Dashboard now exposes weekly availability, temporary unavailable windows, project health/progress, recurrence creation and single-occurrence overrides, visible reminder failures, explicit default-duration preferences, and exact-time AI rescheduling with confirmation when elastic blocks are affected.
+
+Recurring instances use `<templateTaskId>@<date>` task identities and are materialized lazily when a date is read. A materialized occurrence is scheduled through the same scheduler; an unavailable slot remains an unplanned task instead of being silently dropped. Updating an occurrence changes only that occurrence, while deleting the parent rule removes generated instances and their outbox rows.
+
+The remaining external gates are intentionally isolated from the core: valid cloud AI credentials, official QQ C2C account/intent/sandbox access, and a real browser push subscription. The application remains usable through manual scheduling and website AI when any channel is unavailable.

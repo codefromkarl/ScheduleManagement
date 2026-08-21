@@ -1,0 +1,10 @@
+node_modules
+.next
+coverage
+backups
+data
+*.tsbuildinfo
+.env*
+.pnpm-debug.log*
+.git
+.trellis
