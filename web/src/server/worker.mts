@@ -18,10 +18,12 @@ import {
   claimQqScheduleProposal,
   createQqScheduleProposal,
   findQqScheduleProposal,
+  findQqSafeTimeCandidates,
   formatQqScheduleProposal,
   markQqScheduleProposalApplied,
   parseQqProposalAction,
   parseQqProposalButtonData,
+  parseQqProposalEdit,
   qqProposalKeyboard,
   releaseQqScheduleProposal,
 } from "@/server/qq/schedule-proposals";
@@ -186,6 +188,43 @@ async function handleProposalAction(ownerId: string, receiptId: string, action: 
   }
 }
 
+async function handleProposalEdit(ownerId: string, receiptId: string, edit: NonNullable<ReturnType<typeof parseQqProposalEdit>>) {
+  const proposal = await findQqScheduleProposal(ownerId, edit.publicId);
+  if (!proposal || proposal.status !== "pending") return { reply: terminalProposalReply(proposal?.status) };
+  const store = getActiveScheduleStore();
+  if (edit.kind === "change_time" && edit.startMinutes === undefined) {
+    const candidates = await findQqSafeTimeCandidates(store, proposal.intent);
+    const lines = candidates.length > 0
+      ? candidates.map((candidate, index) => `${index + 1}. ${candidate.date} ${String(Math.floor(candidate.startMinutes / 60)).padStart(2, "0")}:${String(candidate.startMinutes % 60).padStart(2, "0")}–${String(Math.floor(candidate.endMinutes / 60)).padStart(2, "0")}:${String(candidate.endMinutes % 60).padStart(2, "0")}`)
+      : ["当前没有其他不移动任务的安全时间。"];
+    const reply = `其他安全时间 · ${proposal.publicId}\n\n${lines.join("\n")}\n\n回复“改时间 ${proposal.publicId} YYYY-MM-DD HH:MM”生成新预览；原提案仍未执行。`;
+    await finishReceivedReceipt(receiptId, reply, { kind: "proposal_edit", action: "change_time_candidates", proposalId: proposal.id });
+    return { reply };
+  }
+  if (edit.kind === "change_duration" && edit.durationMinutes === undefined) {
+    const reply = `选择新时长 · ${proposal.publicId}\n\n15 / 30 / 45 / 60 / 90 / 120 分钟\n\n回复“改时长 ${proposal.publicId} 60”；选择后会生成新预览，不会直接执行。`;
+    await finishReceivedReceipt(receiptId, reply, { kind: "proposal_edit", action: "change_duration_choices", proposalId: proposal.id });
+    return { reply };
+  }
+
+  let intent: QqScheduleProposalIntent;
+  if (edit.kind === "change_time") {
+    const date = edit.date ?? (proposal.intent.kind === "insert" ? proposal.intent.task.date : proposal.intent.date);
+    intent = proposal.intent.kind === "insert"
+      ? { ...proposal.intent, task: { ...proposal.intent.task, date, preferredStartMinutes: edit.startMinutes, exactStartMinutes: edit.startMinutes } }
+      : { ...proposal.intent, date, startMinutes: edit.startMinutes! };
+  } else {
+    if (proposal.intent.kind !== "insert") {
+      const reply = "已排期任务的时长修改需要同时预览任务字段和时间块，本阶段未执行；请重新描述完整调整要求。";
+      await finishReceivedReceipt(receiptId, reply, { kind: "proposal_edit", action: "change_duration_unsupported", proposalId: proposal.id });
+      return { reply };
+    }
+    intent = { ...proposal.intent, task: { ...proposal.intent.task, estimatedMinutes: edit.durationMinutes! } };
+  }
+  const created = await createProposal(ownerId, receiptId, intent);
+  return { reply: created.reply, proposal: created.proposal };
+}
+
 if (!reminderChannelIsEnabled("qq")) {
   console.error("[goalset-worker] QQ reminder channel is disabled by REMINDER_CHANNELS");
   process.exitCode = 1;
@@ -241,6 +280,7 @@ if (!reminderChannelIsEnabled("qq")) {
     const text = message.content.trim();
     const controlCommand = parseQqControlCommand(text);
     const proposalAction = parseQqProposalAction(text);
+    const proposalEdit = parseQqProposalEdit(text);
     const { optimize, commandText } = parseQqCommandMode(text);
 
     try {
@@ -253,6 +293,13 @@ if (!reminderChannelIsEnabled("qq")) {
         const responseText = await handleProposalAction(String(message.senderId), receipt.id, proposalAction);
         await sendActionReply(bot, String(message.senderId), message.replyTarget, responseText);
         await finishReceivedReceipt(receipt.id, responseText, { kind: "proposal_action", action: proposalAction.action });
+        return;
+      }
+      if (proposalEdit) {
+        const result = await handleProposalEdit(String(message.senderId), receipt.id, proposalEdit);
+        if (result.proposal) await sendProposalReply(bot, message.replyTarget, result.reply, result.proposal.publicId, result.proposal.preview.decision);
+        else await bot.sendText(message.replyTarget, result.reply);
+        await finishReceivedReceipt(receipt.id, result.reply, { kind: "proposal_edit", action: proposalEdit.kind, publicId: proposalEdit.publicId });
         return;
       }
       if (optimize && !commandText) {

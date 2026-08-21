@@ -120,6 +120,7 @@ After implementation:
       casting payload fields locally
 - [ ] Checked that derived state points back to the source event identifier
       (`seq`, `id`, `version`) instead of inventing a second cursor
+- [ ] For external UI capabilities, separated provider acceptance from client rendering/interaction evidence (for example, a QQ keyboard HTTP 200 does not prove buttons appeared).
 
 ---
 

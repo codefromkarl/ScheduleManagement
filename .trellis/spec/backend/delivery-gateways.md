@@ -14,6 +14,9 @@ POST /api/qq/test      { delayMinutes?: integer 0..60 } -> 202 { reminderId, sta
 GET  /api/status       -> reminderChannels[], qqConfigured, pwaConfigured, pwaSubscriptionCount, workers[]
 GET  /api/reminders    -> sentAt, receivedAt, status, error
 pnpm qq:pair           -> one-time C2C owner identification
+pnpm qq:image-smoke    -> dry-run PNG render; explicit env opt-in sends one image
+
+qq_schedule_proposals  -> one active owner slot, typed intent/preview, 15-minute expiry
 
 reminders.kind         += "test"
 reminders.received_at  INTEGER timestamp_ms nullable
@@ -39,6 +42,7 @@ QQBOT_APP_ID
 QQBOT_APP_SECRET
 QQBOT_OWNER_USER_ID
 QQBOT_PAIRING_CODE     # optional six-digit override for a supervised pairing run
+QQBOT_INLINE_KEYBOARD_ENABLED  # exact "true" only after client-render + interaction acceptance
 
 NEXT_PUBLIC_VAPID_PUBLIC_KEY
 VAPID_PRIVATE_KEY
@@ -59,6 +63,11 @@ ASTRBOT_SMOKE_SEND     # explicit true only for one external smoke message
 - The production QQ worker keeps SDK debug logging disabled because the SDK may log outbound/inbound message bodies. Provider errors pass through `sanitizedQqError()` before logs, worker health, or reminder error storage; no AppSecret may appear in any of them.
 - Reserved QQ control commands are parsed before the scheduling command boundary. `已发送`, `已收到`, messages beginning with `都收到了` or `身份验证收到`, and `帮助`/`菜单`/`/help` produce a concise channel response and never create or modify tasks. Similar words inside a real task sentence are not intercepted.
 - The QQ test endpoint defaults to immediate delivery and accepts an optional integer delay of at most 60 minutes. Delayed tests remain ordinary pending outbox rows so the same worker claim/retry/deduplication path proves proactive delivery beyond a passive reply window.
+- QQ schedule-affecting commands are fail-closed through `previewTask()` / `previewRescheduleTask()` and `qq_schedule_proposals`. A pending proposal may write only command/proposal records; task, block, applied ChangeSet, and reminder rows remain zero until a valid confirm/save-unplanned action claims the proposal and revalidates the latest schedule.
+- Each owner has one `activeSlot="active"`. A new proposal transactionally supersedes the previous slot; pending proposals expire after 15 minutes; `applying` is an atomic claim state; applied/cancelled/superseded/expired are terminal. Public proposal IDs are opaque and actions remain idempotent.
+- Inline keyboard is capability-gated by `QQBOT_INLINE_KEYBOARD_ENABLED`. Provider HTTP acceptance is insufficient: enable only after a real QQ client displays buttons and the Gateway receives the matching interaction. The current bot accepted keyboard payloads but rendered no buttons, so production keeps the flag false and sends text fallback only.
+- Complex proposal images are supplemental. Deterministic SVG-to-PNG rendering triggers only for moves, cross-date, or occupied no-slot context; PNG/API acceptance must be followed by client receipt. Image generation/upload failure leaves the same proposal pending and sends complete text fallback.
+- Text fallback supports `改时间 P-ID` for up to three deterministic no-move candidates across a bounded seven-day search, `改时间 P-ID [YYYY-MM-DD] HH:MM` for a new exact-time preview, and `改时长 P-ID N` for 15-minute-aligned insert-task duration previews. Every edit supersedes the old proposal and resets TTL; it never applies directly. Unsupported scheduled-task duration edits fail closed.
 - `sentAt` means the push provider accepted at least one device request. It does not mean a device received or displayed the notification.
 - The service worker posts `/api/pwa/receipt` from the push event; only then is `receivedAt` set and the UI may say “设备已收到”.
 - A receipt is accepted only for a PWA reminder in `sending` or `sent` state. A failed/pending reminder cannot be forged into received state.
@@ -83,6 +92,15 @@ ASTRBOT_SMOKE_SEND     # explicit true only for one external smoke message
 | User sends a reserved receipt/help command | Claim/deduplicate the message, return the control reply, and stop before AI or schedule services. |
 | Task text merely contains `已收到` | Continue normal task parsing unless the whole message matches a reserved receipt form. |
 | QQ test delay is negative, fractional, or over 60 | `400 INVALID_REQUEST`; do not create an outbox row. |
+| Pending QQ schedule proposal | Permit proposal/receipt rows only; task/block/ChangeSet/reminder counts for the proposed task stay zero. |
+| New proposal while one is pending | Mark old proposal/receipt superseded, free its slot, and create exactly one new active slot. |
+| Confirm sees changed schedule fingerprint | Do not apply; supersede with a fresh preview requiring another confirmation. |
+| Confirm/cancel repeats a terminal proposal | Return stable no-op copy; create no second task/change. |
+| Keyboard API returns success but client shows no buttons | Treat capability as failed; keep `QQBOT_INLINE_KEYBOARD_ENABLED=false` and use text actions. |
+| Proposal image API accepts but client receipt is unknown | Report provider acceptance only; human client observation is the delivery gate. |
+| User requests time candidates | Return at most three rules-safe/no-move slots; do not change proposal or schedule. |
+| User selects exact time/duration | Create a replacement preview/version and supersede the old proposal; require confirmation again. |
+| Scheduled-task duration edit lacks atomic field/block preview support | Refuse with explanatory copy; do not partially update task or block. |
 | VAPID credentials missing | `409 PWA_NOT_CONFIGURED`; Dashboard remains usable. |
 | No subscribed device | `409 PWA_NOT_SUBSCRIBED`; do not enqueue a fake test success. |
 | Push provider accepts | Set `sentAt`; UI says provider accepted while waiting for receipt. |
@@ -100,6 +118,8 @@ ASTRBOT_SMOKE_SEND     # explicit true only for one external smoke message
 - Good: QQ-only selection ignores leftover VAPID credentials, the PWA worker is stopped, and a QQ test remains visibly unverified until the owner confirms the client message.
 - Good: a supervised one-time code binds the intended C2C sender, then the normal worker enforces exact owner equality for every command.
 - Good: `都收到了，测试提醒2条` records a receipt response while `整理已收到的客户文件` remains a task command.
+- Good: a real QQ preview produces one pending proposal and zero business rows; cancel keeps zero; confirm produces one task/block/ChangeSet; repeated confirm stays one; ChangeSet undo cleans the test task.
+- Good: the current client receives a 28 KB complex proposal PNG while the invisible keyboard capability remains explicitly disabled.
 - Good: provider accepts, the service worker posts a receipt, notification history changes from “等待设备回执” to “设备已收到” after PWA is explicitly re-enabled.
 - Good: one stale phone endpoint is pruned while another device receives the same reminder.
 - Base: QQ-only is selected without credentials; scheduling remains usable while settings truthfully show that reminders cannot send.
@@ -111,6 +131,7 @@ ASTRBOT_SMOKE_SEND     # explicit true only for one external smoke message
 - Bad: infer selected channels from whichever secrets happen to remain in `.env.local`.
 - Bad: start a first-message-wins pairing listener with no nonce, or leave SDK debug logs enabled after real credentials are installed.
 - Bad: route delivery acknowledgements through the AI duration parser, or implement delayed acceptance with a second timer outside the reminder outbox.
+- Bad: call `insertTask()` from a QQ message before confirmation, infer button support from HTTP 200, or let an image failure apply/cancel a proposal.
 
 ## 6. Tests Required
 
@@ -118,6 +139,9 @@ ASTRBOT_SMOKE_SEND     # explicit true only for one external smoke message
 - Unit-test channel parsing, QQ-only selection, unknown values, and selection-versus-credential separation.
 - Unit-test six-digit pairing command normalization/rejection and provider-error secret redaction/length bounds.
 - Unit-test reserved receipt/help commands against near-match task text, plus immediate/default and bounded delayed QQ test scheduling.
+- Unit/SQLite-test preview zero-write, explicit save-unplanned, one-slot supersession, receipt closure, expiry, atomic claim, terminal no-op, fingerprint refresh, and migration integrity.
+- Unit-test button data/keyboard construction and deterministic image trigger/SVG escaping/PNG signature. Real acceptance separately verifies text fallback, client-visible image, and (when permission exists) client-visible buttons plus interaction receipt.
+- Unit-test edit command parsing, 15-minute validation, bounded safe-time candidates, no-write candidate reads, version supersession, and unsupported edit refusal.
 - API/browser acceptance for QQ test must distinguish pending, API accepted, failed, and human-confirmed client receipt; do not manufacture a receipt timestamp.
 - SQLite-test `receivedAt` round-trip and migration integrity.
 - Browser-test truthful outcomes for enabled, missing-key, and Push-Service-rejected subscription attempts.
@@ -175,4 +199,14 @@ await parseScheduleCommand(message.content, date, snapshot);
 // Correct: reserved channel controls terminate before scheduling.
 const control = parseQqControlCommand(message.content);
 if (control) return replyWithoutMutation(control.reply);
+```
+
+```ts
+// Wrong: API acceptance is assumed to prove a rendered button.
+await bot.sendTextWithKeyboard(target, preview, keyboard);
+enableButtons();
+
+// Correct: keep the transport behind an explicit human-accepted capability.
+if (qqInlineKeyboardIsEnabled()) await bot.sendTextWithKeyboard(target, preview, keyboard);
+else await bot.sendText(target, preview);
 ```

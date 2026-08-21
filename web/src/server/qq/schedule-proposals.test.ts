@@ -15,10 +15,12 @@ import {
   claimQqScheduleProposal,
   createQqScheduleProposal,
   findQqScheduleProposal,
+  findQqSafeTimeCandidates,
   formatQqScheduleProposal,
   markQqScheduleProposalApplied,
   parseQqProposalAction,
   parseQqProposalButtonData,
+  parseQqProposalEdit,
   qqProposalKeyboard,
   scheduleSnapshotFingerprint,
 } from "./schedule-proposals";
@@ -81,6 +83,10 @@ describe("QQ schedule proposal preview", () => {
     expect(parseQqProposalButtonData("confirm:P-12AB34CD")).toBeNull();
     expect(qqProposalKeyboard("P-12AB34CD", "auto").content.rows[0].buttons.map((button) => button.render_data.label)).toEqual(["确认安排", "取消"]);
     expect(qqProposalKeyboard("P-12AB34CD", "no_slot").content.rows[0].buttons[0].render_data.label).toBe("保存到待安排");
+    expect(parseQqProposalEdit("改时间 P-12AB34CD")).toEqual({ kind: "change_time", publicId: "P-12AB34CD" });
+    expect(parseQqProposalEdit("改时间 P-12AB34CD 2026-08-22 14:30")).toEqual({ kind: "change_time", publicId: "P-12AB34CD", date: "2026-08-22", startMinutes: 14 * 60 + 30 });
+    expect(parseQqProposalEdit("改时长 P-12AB34CD 90分钟")).toEqual({ kind: "change_duration", publicId: "P-12AB34CD", durationMinutes: 90 });
+    expect(parseQqProposalEdit("改时长 P-12AB34CD 17")).toBeNull();
   });
 
   it("creates a no-slot task only through the explicit save-unplanned mutation", async () => {
@@ -94,6 +100,17 @@ describe("QQ schedule proposal preview", () => {
     expect(saved.changeSetId).toBeTruthy();
     expect(saved.snapshot.tasks.some((item) => item.id === task.id)).toBe(true);
     expect(saved.snapshot.blocks.some((block) => block.taskId === task.id)).toBe(false);
+  });
+
+  it("offers up to three deterministic no-move time alternatives without writing", async () => {
+    const store = new InMemoryScheduleStore();
+    const seeded = await store.getSnapshot(proposalTask.date);
+    for (const task of seeded.tasks) await store.deleteTask(task.id);
+    const before = await store.getSnapshot(proposalTask.date);
+    const candidates = await findQqSafeTimeCandidates(store, proposalIntent);
+    expect(candidates).toHaveLength(3);
+    expect(candidates.every((candidate) => candidate.startMinutes % 15 === 0)).toBe(true);
+    expect(await store.getSnapshot(proposalTask.date)).toEqual(before);
   });
 });
 

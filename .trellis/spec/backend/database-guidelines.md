@@ -38,6 +38,7 @@ pnpm db:import-postgres <snapshot.json>
 - `db:backup` uses SQLite `VACUUM INTO`, immediately restricts the output to mode `0600`, and verifies the result with `PRAGMA quick_check`. Restore requires stopped app/workers and the explicit confirmation variable.
 - `db:seed` is the only command allowed to create demo tasks. API reads must never seed or mutate demo data.
 - Reminder dispatch claims `pending` rows with an atomic conditional update; duplicate QQ input is guarded by the unique `(channel, externalMessageId)` receipt index.
+- QQ schedule proposals live in `qq_schedule_proposals`. A nullable `active_slot` plus unique `(workspaceId, ownerId, activeSlot)` index permits unlimited terminal history but exactly one non-null active slot. Proposal creation supersedes the old slot and closes its command receipt in the same short transaction.
 - The no-database in-memory store is a development fallback, not a reduced domain implementation. Its cross-date schedule/reschedule/undo projections must match SQLite even though persistence mechanics differ.
 - Multi-day Dashboard reads use `ScheduleStore.getSnapshots(dates)`. SQLite queries each range-owned table once, builds a task lookup Map for block projection, and preserves requested date order; do not implement a range by looping over `getSnapshot()`.
 - Query indexes must follow actual filters and ordering. The current baseline covers workspace/date schedule reads, workspace/weekday availability, recurrence lookup, due reminder delivery, recent reminder/ChangeSet ordering, and pending QQ confirmation lookup. Generate every index change as a Drizzle migration and validate it on a temporary database before deployment.
@@ -53,6 +54,7 @@ pnpm db:import-postgres <snapshot.json>
 | Busy concurrent writer | Wait up to the configured busy timeout, then expose the database failure; do not retry an unbounded transaction. |
 | Schedule conflict | Roll back the mutation and return a proposal/conflict status. |
 | Duplicate reminder or QQ message | Unique indexes and atomic claims prevent a second effect. |
+| Two confirmations race for one QQ proposal | Conditional `pending -> applying` permits one claim; the loser returns a no-op. |
 | PostgreSQL snapshot contains ISO timestamps in date columns | Import exactly the first ten `YYYY-MM-DD` characters. |
 | Backup integrity failure | Fail `db:backup`; do not report the file as usable. |
 | Backup file is group/world-readable | Restrict it to `0600`; private task data must not inherit a permissive umask. |
@@ -69,6 +71,7 @@ pnpm db:import-postgres <snapshot.json>
 
 - Run `pnpm test`, `pnpm lint`, `pnpm exec tsc --noEmit`, `pnpm build`, and `pnpm db:check`.
 - The SQLite integration test must assert JSON/timestamp round trips, exactly one winner for two concurrent reminder claims, `quick_check = ok`, and zero foreign-key violations.
+- Proposal persistence tests must migrate the real SQL ledger, prove one active owner slot, close superseded/expired receipts, allow one concurrent claim, retain typed JSON intent/preview, and link one applied ChangeSet.
 - A migration/import rehearsal must compare all 15 PostgreSQL table counts with SQLite and then verify an API date query returns the imported tasks/blocks.
 - A backup/restore rehearsal must restore into a temporary file, pass `quick_check`, and preserve the task count.
 - Focused adapter tests must compare cross-date placement/reschedule origin removal, target insertion, task-date updates, and undo restoration for the in-memory fallback; SQLite API/browser tests cover the durable equivalent.

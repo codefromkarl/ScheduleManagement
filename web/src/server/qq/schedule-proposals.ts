@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { and, desc, eq, gt, inArray } from "drizzle-orm";
 import type { ScheduleStore } from "@/features/schedule/data/store-types";
 import type { ScheduleSnapshot } from "@/features/schedule/data/types";
+import { findScheduleProposal } from "@/features/schedule/domain/scheduler";
 import type { InlineKeyboard } from "@tencent-connect/qqbot-nodejs";
 import { getDb, type GoalsetDb } from "@/server/db";
 import { commandReceipts, qqScheduleProposals } from "@/server/db/schema";
@@ -145,6 +146,72 @@ export function parseQqProposalAction(message: string): { action: QqProposalActi
   return { action, publicId: match[2]?.toUpperCase() };
 }
 
+export type QqProposalEdit =
+  | { kind: "change_time"; publicId: string; date?: string; startMinutes?: number }
+  | { kind: "change_duration"; publicId: string; durationMinutes?: number };
+
+export function parseQqProposalEdit(message: string): QqProposalEdit | null {
+  const text = message.trim().replace(/\s+/g, " ");
+  const time = text.match(/^改时间\s+(P-[A-F0-9]{8})(?:\s+(?:(20\d{2}-\d{2}-\d{2})\s+)?(\d{1,2})(?:[:点](\d{0,2}))?)?$/i);
+  if (time) {
+    if (!time[3]) return { kind: "change_time", publicId: time[1].toUpperCase() };
+    const hour = Number(time[3]);
+    const minute = Number(time[4] || 0);
+    if (hour > 23 || minute > 59 || minute % 15 !== 0) return null;
+    return { kind: "change_time", publicId: time[1].toUpperCase(), date: time[2], startMinutes: hour * 60 + minute };
+  }
+  const duration = text.match(/^改时长\s+(P-[A-F0-9]{8})(?:\s+(\d{1,3})(?:\s*分钟)?)?$/i);
+  if (!duration) return null;
+  if (!duration[2]) return { kind: "change_duration", publicId: duration[1].toUpperCase() };
+  const durationMinutes = Number(duration[2]);
+  if (durationMinutes < 15 || durationMinutes > 8 * 60 || durationMinutes % 15 !== 0) return null;
+  return { kind: "change_duration", publicId: duration[1].toUpperCase(), durationMinutes };
+}
+
+function shiftDate(date: string, days: number) {
+  const value = new Date(`${date}T00:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
+}
+
+function orderedStarts(snapshot: ScheduleSnapshot, preferred?: number) {
+  const starts = snapshot.availability.flatMap((window) => {
+    const values: number[] = [];
+    for (let value = window.startMinutes; value < window.endMinutes; value += 15) values.push(value);
+    return values;
+  });
+  return [...new Set(starts)].sort((left, right) => preferred === undefined ? left - right : Math.abs(left - preferred) - Math.abs(right - preferred) || left - right);
+}
+
+export type QqSafeTimeCandidate = { date: string; startMinutes: number; endMinutes: number };
+
+export async function findQqSafeTimeCandidates(store: ScheduleStore, intent: QqScheduleProposalIntent, limit = 3): Promise<QqSafeTimeCandidate[]> {
+  const candidates: QqSafeTimeCandidate[] = [];
+  const initialDate = intent.kind === "insert" ? intent.task.date : intent.date;
+  const preferred = intent.kind === "insert" ? intent.task.preferredStartMinutes : intent.startMinutes;
+  const originSnapshot = intent.kind === "reschedule" ? await store.getSnapshot(intent.originDate) : undefined;
+  const originTask = intent.kind === "reschedule" ? originSnapshot?.tasks.find((task) => task.id === intent.taskId) : undefined;
+  const originBlock = intent.kind === "reschedule" ? originSnapshot?.blocks.find((block) => block.taskId === intent.taskId) : undefined;
+  if (intent.kind === "reschedule" && (!originTask || !originBlock)) return [];
+
+  for (let dayOffset = 0; dayOffset < 7 && candidates.length < limit; dayOffset += 1) {
+    const date = shiftDate(initialDate, dayOffset);
+    const snapshot = await store.getSnapshot(date);
+    for (const startMinutes of orderedStarts(snapshot, dayOffset === 0 ? preferred : undefined)) {
+      const task = intent.kind === "insert"
+        ? { ...intent.task, date, preferredStartMinutes: startMinutes, exactStartMinutes: startMinutes }
+        : { ...originTask!, date, preferredStartMinutes: startMinutes, exactStartMinutes: startMinutes, deadlineMinutes: originTask!.deadlineMinutes === undefined ? startMinutes + originTask!.estimatedMinutes : Math.min(originTask!.deadlineMinutes, startMinutes + originTask!.estimatedMinutes) };
+      const existing = intent.kind === "reschedule" && intent.originDate === date ? snapshot.blocks.filter((block) => block.id !== originBlock!.id) : snapshot.blocks;
+      const proposal = findScheduleProposal(task, { date, availability: snapshot.availability, unavailable: snapshot.unavailable, existing, bufferMinutes: snapshot.bufferMinutes, mode: "rules" });
+      if (proposal.decision !== "auto" || !proposal.placement) continue;
+      if (date === initialDate && proposal.placement.startMinutes === preferred) continue;
+      candidates.push({ date, startMinutes: proposal.placement.startMinutes, endMinutes: proposal.placement.endMinutes });
+      if (candidates.length >= limit) break;
+    }
+  }
+  return candidates;
+}
+
 export function qqProposalButtonData(action: QqProposalAction, publicId: string) {
   return `goalset-proposal:${action}:${publicId.toUpperCase()}`;
 }
@@ -190,5 +257,6 @@ export function formatQqScheduleProposal(publicId: string, preview: QqSchedulePr
   lines.push("", "确认前尚未创建任务或修改日程。提案 15 分钟内有效。");
   if (preview.decision === "no_slot") lines.push(`回复“保存到待安排 ${publicId}”或“取消 ${publicId}”。`);
   else lines.push(`回复“确认 ${publicId}”或“取消 ${publicId}”。`);
+  lines.push(`调整：回复“改时间 ${publicId}”查看安全候选，或“改时长 ${publicId} 60”。`);
   return lines.join("\n");
 }

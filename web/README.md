@@ -68,6 +68,12 @@ With `REMINDER_CHANNELS=qq`, Settings exposes a QQ test action. It enqueues one 
 
 `POST /api/qq/test` also accepts `{ "delayMinutes": 15 }` for a bounded proactive-delivery acceptance run. QQ receipt phrases such as `已收到` or `都收到了，测试提醒2条` and `帮助` are reserved channel controls handled before task parsing; they never create or modify a schedule. A normal sentence that merely contains `已收到` remains eligible for task parsing.
 
+QQ schedule creation/rescheduling is proposal-first: preview and pending-proposal persistence create no task/block/applied ChangeSet/reminder rows. Text `确认 P-XXXXXXXX`, `取消 P-XXXXXXXX`, or `保存到待安排 P-XXXXXXXX` revalidates and atomically applies one action. Proposal TTL is 15 minutes and one owner has one active slot. `QQBOT_INLINE_KEYBOARD_ENABLED` defaults false and must remain false until a real client renders buttons and an interaction callback is observed; HTTP acceptance alone is not capability proof.
+
+Complex proposal PNGs use deterministic English time/relationship labels while the companion text retains full Chinese task detail. Run `pnpm qq:image-smoke` for a dry render; external send requires `QQ_PROPOSAL_IMAGE_SMOKE_SEND=true`. Image failure always falls back to text without changing proposal state.
+
+When inline keyboard is unavailable, text proposal edits remain first-class: `改时间 P-XXXXXXXX` lists up to three rules-safe candidates, `改时间 P-XXXXXXXX 2026-08-22 14:30` creates a replacement exact-time preview, and `改时长 P-XXXXXXXX 60` creates a replacement insert-task duration preview. These commands reset the 15-minute proposal TTL but never apply without a later confirmation.
+
 An isolated AstrBot gateway probe is also available without installing AstrBot into Goalset. Set `ASTRBOT_BASE_URL`, a least-privilege `ASTRBOT_API_KEY`, and `ASTRBOT_OWNER_UMO`, then run `pnpm astrbot:smoke`. The command probes `/api/v1/im/bots` only. It sends one external test message only when `ASTRBOT_SMOKE_SEND=true` is explicitly present. AstrBot remains a transport sidecar and must not run a second Goalset scheduler or future-task system.
 
 ### PWA reminders
