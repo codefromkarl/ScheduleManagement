@@ -5,6 +5,8 @@ import {
   text,
   uniqueIndex,
 } from "drizzle-orm/sqlite-core";
+import type { ReminderImportanceReason } from "@/features/schedule/domain/reminder-policy";
+import { REMINDER_POLICIES } from "../../features/schedule/domain/types";
 
 const taskKinds = ["fixed", "flexible", "floating"] as const;
 const taskStatuses = ["todo", "doing", "blocked", "done"] as const;
@@ -50,6 +52,7 @@ export const tasks = sqliteTable("tasks", {
   kind: text("kind", { enum: taskKinds }).notNull(),
   status: text("status", { enum: taskStatuses }).notNull().default("todo"),
   priority: text("priority", { enum: taskPriorities }).notNull().default("normal"),
+  reminderPolicy: text("reminder_policy", { enum: REMINDER_POLICIES }).notNull().default("auto"),
   estimatedMinutes: integer("estimated_minutes").notNull(),
   movable: integer("movable", { mode: "boolean" }).notNull().default(true),
   preferredStartMinutes: integer("preferred_start_minutes"),
@@ -149,6 +152,7 @@ export const reminders = sqliteTable("reminders", {
   scheduledAt: integer("scheduled_at", { mode: "timestamp_ms" }).notNull(),
   status: text("status", { enum: reminderStatuses }).notNull().default("pending"),
   dedupeKey: text("dedupe_key").notNull(),
+  importanceReasons: text("importance_reasons", { mode: "json" }).$type<ReminderImportanceReason[]>(),
   sentAt: integer("sent_at", { mode: "timestamp_ms" }),
   error: text("error"),
   ...auditColumns,

@@ -8,6 +8,20 @@
       "when": 1787279962955,
       "tag": "0000_odd_silk_fever",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1787285711809,
+      "tag": "0001_elite_ben_grimm",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1787285816129,
+      "tag": "0002_confused_scourge",
+      "breakpoints": true
     }
   ]
 }

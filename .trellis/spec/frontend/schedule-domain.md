@@ -20,6 +20,12 @@ scheduleTask(
   options: { mode: SchedulingMode; startMinutes?: number; confirm?: boolean },
 ): Promise<ScheduleExistingTaskResult>
 
+arrangeUnplanned(date: string): Promise<ArrangeUnplannedResult>
+closeDay(date: string, action: "unplan" | "move_tomorrow"): Promise<DailyCloseResult>
+calculateDailyCapacity(snapshot: ScheduleSnapshot): DailyCapacity
+deriveTimelineRange(snapshot: ScheduleSnapshot): TimelineRange
+groupUnplannedTasks(tasks: ScheduleTask[], today: string): UnplannedGroup[]
+
 placementToBlock(
   task: ScheduleTask,
   placement: SchedulePlacement,
@@ -43,6 +49,11 @@ The current implementation lives in `web/src/features/schedule/domain/scheduler.
 - After hard-constraint filtering, `rules` ordering is exact start, otherwise closest to an explicit preferred start, otherwise chronological. Only `optimize` mode scores deadline slack, priority, fragmentation, and same-project continuity.
 - `insertTask(..., { mode: "rules" })` persists a valid task even when the proposal is `no_slot`; the snapshot then exposes that task without a block so the UI can render it as unplanned.
 - `scheduleTask(..., { mode: "rules" })` requires an explicit 15-minute-aligned `startMinutes`. `mode: "optimize"` may omit it and ask the deterministic scheduler for a candidate.
+- `arrangeUnplanned` ranks priority, deadline, title, and ID; it simulates rules-only placement against a growing working block set and persists all successful blocks in one transaction/ChangeSet.
+- `closeDay` affects incomplete flexible/floating tasks only. It removes their blocks and optionally changes their date to the next UTC calendar key; fixed and done tasks remain untouched.
+- Timeline range starts from 08:00–19:00 and expands to whole hours for earlier/later availability, blackouts, blocks, or attempted conflict markers. Labels, blocks, current time, drag coordinates, and conflict positions consume the same range.
+- Capacity is a pure 15-minute-slot projection. Missing availability is `unknown`; capacity deficit or deadline risk is `impossible`; at most 60 minutes/configured-buffer margin is `tight`; otherwise it is `healthy`.
+- Cross-date unplanned grouping is relative to the Shanghai today key and emits overdue/today/tomorrow/this-week/later without mutating task dates.
 
 ## 4. Validation & Error Matrix
 
@@ -85,6 +96,8 @@ The scheduler test suite must assert:
 - rules-mode insertion never moves an existing elastic task and persists `no_slot` work as task-without-block;
 - explicit optimize mode may return deterministic moves but does not apply them before confirmation;
 - manual unplanned placement validates the requested 15-minute start and preserves the task identity.
+- batch arrange and daily close restore the complete prior block/date state through one undo.
+- dynamic ranges include early/late boundaries, capacity statuses expose exact minutes, and cross-date groups remain calendar-stable.
 
 Future tests should add randomized/property coverage for multi-window availability and concurrent idempotent command handling.
 

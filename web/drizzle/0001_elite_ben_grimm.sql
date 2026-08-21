@@ -1,0 +1,1 @@
+ALTER TABLE `tasks` ADD `reminder_policy` text DEFAULT 'auto' NOT NULL;

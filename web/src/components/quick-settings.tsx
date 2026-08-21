@@ -35,11 +35,12 @@ type QuickSettingsProps = {
   onPwaEnable: () => Promise<void>;
   onNotify: (message: string) => void;
   onClose: () => void;
+  showHeader?: boolean;
   workers?: WorkerHealth[];
   qqConfigured?: boolean;
 };
 
-export function QuickSettings({ bufferMinutes, onBufferChange, onPwaEnable, onNotify, onClose, workers = [], qqConfigured = false }: QuickSettingsProps) {
+export function QuickSettings({ bufferMinutes, onBufferChange, onPwaEnable, onNotify, onClose, showHeader = true, workers = [], qqConfigured = false }: QuickSettingsProps) {
   const [rules, setRules] = useState<WeeklyRule[]>(defaultRules);
   const [unavailable, setUnavailable] = useState<UnavailableWindow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -133,10 +134,10 @@ export function QuickSettings({ bufferMinutes, onBufferChange, onPwaEnable, onNo
 
   return (
     <section className="quick-settings" aria-label="快速设置">
-      <div className="quick-settings__header">
+      {showHeader && <div className="quick-settings__header">
         <div><strong>设置与偏好</strong><span>排程只使用这里显示的可用时间；缓冲和提醒会保存到当前工作区。</span></div>
         <Button variant="ghost" size="icon" type="button" aria-label="关闭设置" onClick={onClose}><X size={14} /></Button>
-      </div>
+      </div>}
       <div className="quick-settings__body">
         <div className="quick-settings__controls">
           <span>任务间缓冲</span>
@@ -170,7 +171,7 @@ export function QuickSettings({ bufferMinutes, onBufferChange, onPwaEnable, onNo
           </form>
           {unavailable.length > 0 && <div className="unavailable-list">{unavailable.map((item) => <div className="unavailable-row" key={item.id}><span>{item.date} · {minutesToTime(item.startMinutes)}–{minutesToTime(item.endMinutes)} · {item.reason}</span><Button variant="ghost" size="icon" type="button" aria-label={`删除 ${item.reason}`} onClick={() => void removeUnavailable(item.id)}><Trash2 size={13} /></Button></div>)}</div>}
         </div>
-        <details className="settings-advanced"><summary>提醒与集成状态</summary><div className="settings-advanced__content"><div className="worker-health"><span>后台提醒状态</span>{workers.length === 0 ? <strong>尚未运行</strong> : workers.map((worker) => <span key={worker.workerName} className={`worker-health__item worker-health__item--${worker.status}`}><i />{worker.workerName.toUpperCase()} {worker.status === "success" ? "正常" : worker.status === "error" ? "异常" : worker.status}</span>)}{!qqConfigured && <span className="worker-health__item worker-health__item--muted"><i />QQ 未配置</span>}</div><Button variant="outline" size="sm" type="button" onClick={() => void onPwaEnable()}><Clock3 size={13} /> 开启 PWA 提醒</Button></div></details>
+        <details className="settings-advanced"><summary>提醒与集成状态</summary><div className="settings-advanced__content"><div><div className="worker-health"><span>后台提醒状态</span>{workers.length === 0 ? <strong>尚未运行</strong> : workers.map((worker) => <span key={worker.workerName} className={`worker-health__item worker-health__item--${worker.status}`}><i />{worker.workerName.toUpperCase()} {worker.status === "success" ? "正常" : worker.status === "error" ? "异常" : worker.status}</span>)}{!qqConfigured && <span className="worker-health__item worker-health__item--muted"><i />QQ 未配置</span>}</div><p className="reminder-policy-summary"><strong>QQ 重要提醒</strong><span>高优先级任务与固定安排提前 15 分钟；重要改期即时提醒；每日 09:00 仅在有逾期、阻塞或容量风险时发送摘要。单任务可在详情中设为强制提醒或不提醒。</span></p></div><Button variant="outline" size="sm" type="button" onClick={() => void onPwaEnable()}><Clock3 size={13} /> 开启 PWA 提醒</Button></div></details>
         {error && <p className="settings-error" role="alert">{error}</p>}
       </div>
     </section>

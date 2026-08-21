@@ -1,8 +1,9 @@
-import type { Priority, ScheduleKind, ScheduleTask, TaskStatus } from "./domain/types";
+import type { Priority, ReminderPolicy, ScheduleKind, ScheduleTask, TaskStatus } from "./domain/types";
+import { rankUnplannedTasks } from "./domain/unplanned";
 import { createDemoSnapshot } from "./data/demo-snapshot";
 import type { ScheduleSnapshot } from "./data/types";
 
-export type { Priority, ScheduleKind, TaskStatus } from "./domain/types";
+export type { Priority, ReminderPolicy, ScheduleKind, TaskStatus } from "./domain/types";
 
 export type ScheduleItem = {
   id: string;
@@ -12,6 +13,7 @@ export type ScheduleItem = {
   kind: ScheduleKind;
   status: TaskStatus;
   priority: Priority;
+  reminderPolicy: ReminderPolicy;
   project: string;
   startMinutes: number;
   durationMinutes: number;
@@ -55,6 +57,7 @@ export function scheduleItemsFromSnapshot(snapshot: ScheduleSnapshot): ScheduleI
       kind: task.kind,
       status: task.status,
       priority: task.priority,
+      reminderPolicy: task.reminderPolicy,
       project: task.projectId ?? "未分类",
       startMinutes: block.startMinutes,
       durationMinutes: block.durationMinutes,
@@ -67,12 +70,7 @@ export function scheduleItemsFromSnapshot(snapshot: ScheduleSnapshot): ScheduleI
 
 export function unplannedTasksFromSnapshot(snapshot: ScheduleSnapshot): UnplannedTask[] {
   const scheduledTaskIds = new Set(snapshot.blocks.map((block) => block.taskId));
-  const priorityRank: Record<Priority, number> = { high: 0, normal: 1, low: 2 };
-  return snapshot.tasks
-    .filter((task) => task.status !== "done" && !scheduledTaskIds.has(task.id))
-    .sort((left, right) => priorityRank[left.priority] - priorityRank[right.priority]
-      || (left.deadlineMinutes ?? Number.POSITIVE_INFINITY) - (right.deadlineMinutes ?? Number.POSITIVE_INFINITY)
-      || left.title.localeCompare(right.title, "zh-CN"))
+  return rankUnplannedTasks(snapshot.tasks.filter((task) => task.status !== "done" && !scheduledTaskIds.has(task.id)))
     .map(({ id, title, date, kind, status, priority, estimatedMinutes, preferredStartMinutes, deadlineMinutes, projectId }) => ({ id, title, date, kind, status, priority, estimatedMinutes, preferredStartMinutes, deadlineMinutes, projectId }));
 }
 

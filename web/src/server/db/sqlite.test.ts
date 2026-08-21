@@ -1,4 +1,4 @@
-import { readFile, rm, mkdtemp } from "node:fs/promises";
+import { readFile, readdir, rm, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient } from "@libsql/client/node";
@@ -22,8 +22,10 @@ describe("SQLite persistence", () => {
     const secondClient = createClient({ url: databaseUrl });
 
     try {
-      const migration = await readFile(new URL("../../../drizzle/0000_odd_silk_fever.sql", import.meta.url), "utf8");
-      await firstClient.executeMultiple(migration.replaceAll("--> statement-breakpoint", ""));
+      const migrationDirectory = new URL("../../../drizzle/", import.meta.url);
+      const migrationFiles = (await readdir(migrationDirectory)).filter((name) => name.endsWith(".sql")).sort();
+      const migrations = await Promise.all(migrationFiles.map((name) => readFile(new URL(name, migrationDirectory), "utf8")));
+      for (const migration of migrations) await firstClient.executeMultiple(migration.replaceAll("--> statement-breakpoint", ""));
       await Promise.all([
         firstClient.executeMultiple("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;"),
         secondClient.executeMultiple("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;"),
@@ -34,6 +36,7 @@ describe("SQLite persistence", () => {
 
       await firstDb.insert(schema.workspaces).values({ id: "personal", name: "个人工作区" });
       await firstDb.insert(schema.preferences).values({ id: "preference", workspaceId: "personal", key: "bufferMinutes", value: 15 });
+      await firstDb.insert(schema.tasks).values({ id: "task", workspaceId: "personal", title: "提醒测试", date: "2026-08-21", kind: "fixed", estimatedMinutes: 30, movable: false });
       await firstDb.insert(schema.reminders).values({
         id: "reminder",
         workspaceId: "personal",
@@ -41,12 +44,16 @@ describe("SQLite persistence", () => {
         channel: "pwa",
         scheduledAt,
         dedupeKey: "daily-summary:test:pwa",
+        importanceReasons: ["blocked_task", "impossible_capacity"],
       });
 
       const [preference] = await firstDb.select().from(schema.preferences);
+      const [task] = await firstDb.select().from(schema.tasks);
       const [reminder] = await firstDb.select().from(schema.reminders);
       expect(preference.value).toBe(15);
+      expect(task.reminderPolicy).toBe("auto");
       expect(reminder.scheduledAt).toEqual(scheduledAt);
+      expect(reminder.importanceReasons).toEqual(["blocked_task", "impossible_capacity"]);
 
       const claim = (database: typeof firstDb) => database
         .update(schema.reminders)

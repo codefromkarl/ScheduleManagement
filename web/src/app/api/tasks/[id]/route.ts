@@ -1,11 +1,13 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getActiveScheduleStore } from "@/features/schedule/data/active-store";
+import { reminderPolicySchema } from "@/features/schedule/data/contract";
 
 const updateSchema = z.object({
   title: z.string().min(1).max(200).optional(),
   status: z.enum(["todo", "doing", "blocked", "done"]).optional(),
   priority: z.enum(["low", "normal", "high"]).optional(),
+  reminderPolicy: reminderPolicySchema.optional(),
   notes: z.string().max(2000).optional(),
 }).refine((value) => Object.keys(value).length > 0, "at least one update is required");
 

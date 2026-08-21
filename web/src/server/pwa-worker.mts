@@ -3,9 +3,11 @@ config({ path: ".env.local" });
 import webpush from "web-push";
 import { and, eq, lte, lt } from "drizzle-orm";
 import { getDb } from "@/server/db";
+import { getActiveScheduleStore } from "@/features/schedule/data/active-store";
+import { evaluateDailySummary } from "@/features/schedule/domain/reminder-policy";
 import { pushSubscriptions, reminders } from "@/server/db/schema";
 import { pwaIsConfigured } from "@/server/qq/config";
-import { configuredReminderChannels, dailySummaryTime, reminderMessage, REMINDER_WORKSPACE_ID, todayInShanghai } from "@/server/reminders";
+import { dailySummaryTime, reminderMessage, REMINDER_WORKSPACE_ID, todayInShanghai } from "@/server/reminders";
 import { recordWorkerHealth } from "@/server/worker-health";
 
 if (!pwaIsConfigured()) {
@@ -17,9 +19,10 @@ if (!pwaIsConfigured()) {
   async function ensureDailySummary() {
     const db = getDb();
     const date = todayInShanghai();
-    const channels = configuredReminderChannels();
-    if (!channels.includes("pwa")) return;
-    await db.insert(reminders).values({ id: `daily-summary:${date}:pwa`, workspaceId: REMINDER_WORKSPACE_ID, kind: "daily_summary", channel: "pwa", scheduledAt: dailySummaryTime(date), status: "pending", dedupeKey: `daily-summary:${date}:pwa` }).onConflictDoNothing();
+    const snapshot = await getActiveScheduleStore().getSnapshot(date);
+    const decision = evaluateDailySummary(snapshot);
+    if (!decision.eligible) return;
+    await db.insert(reminders).values({ id: `daily-summary:${date}:pwa`, workspaceId: REMINDER_WORKSPACE_ID, kind: "daily_summary", channel: "pwa", scheduledAt: dailySummaryTime(date), status: "pending", dedupeKey: `daily-summary:${date}:pwa`, importanceReasons: decision.reasons }).onConflictDoNothing();
   }
 
   async function dispatch() {
@@ -38,7 +41,7 @@ if (!pwaIsConfigured()) {
           continue;
         }
         try {
-          await Promise.all(subscriptions.map((subscription) => webpush.sendNotification({ endpoint: subscription.endpoint, keys: { p256dh: subscription.p256dh, auth: subscription.auth } }, JSON.stringify({ title: "goalset 提醒", body: reminderMessage(reminder.kind, reminder.taskId), url: "/" }))));
+          await Promise.all(subscriptions.map((subscription) => webpush.sendNotification({ endpoint: subscription.endpoint, keys: { p256dh: subscription.p256dh, auth: subscription.auth } }, JSON.stringify({ title: "goalset 提醒", body: reminderMessage(reminder.kind, reminder.taskId, reminder.importanceReasons ?? []), url: "/" }))));
           await db.update(reminders).set({ status: "sent", sentAt: new Date(), updatedAt: new Date() }).where(eq(reminders.id, reminder.id));
         } catch (error) {
           await db.update(reminders).set({ status: "failed", error: error instanceof Error ? error.message : "unknown error", updatedAt: new Date() }).where(eq(reminders.id, reminder.id));

@@ -4,21 +4,23 @@ import { QQBot } from "@tencent-connect/qqbot-nodejs";
 import { and, desc, eq, lte, lt } from "drizzle-orm";
 import { getActiveScheduleStore } from "@/features/schedule/data/active-store";
 import type { ScheduleTask } from "@/features/schedule/domain/types";
+import { evaluateDailySummary } from "@/features/schedule/domain/reminder-policy";
 import { parseScheduleCommand } from "@/server/ai/provider";
 import { qqConfigError, qqIsConfigured } from "@/server/qq/config";
 import { parseQqCommandMode } from "@/server/qq/command-mode";
 import { getDb } from "@/server/db";
 import { commandReceipts, reminders } from "@/server/db/schema";
-import { configuredReminderChannels, dailySummaryTime, reminderMessage, REMINDER_WORKSPACE_ID, todayInShanghai } from "@/server/reminders";
+import { dailySummaryTime, reminderMessage, REMINDER_WORKSPACE_ID, todayInShanghai } from "@/server/reminders";
 import { recordWorkerHealth } from "@/server/worker-health";
 
 async function ensureDailySummary() {
   const db = getDb();
   const date = todayInShanghai();
   const scheduledAt = dailySummaryTime(date);
-  const channels = configuredReminderChannels();
-  if (channels.length === 0) return;
-  await db.insert(reminders).values(channels.map((channel) => ({ id: `daily-summary:${date}:${channel}`, workspaceId: REMINDER_WORKSPACE_ID, kind: "daily_summary" as const, channel, scheduledAt, status: "pending" as const, dedupeKey: `daily-summary:${date}:${channel}` }))).onConflictDoNothing();
+  const snapshot = await getActiveScheduleStore().getSnapshot(date);
+  const decision = evaluateDailySummary(snapshot);
+  if (!decision.eligible) return;
+  await db.insert(reminders).values({ id: `daily-summary:${date}:qq`, workspaceId: REMINDER_WORKSPACE_ID, kind: "daily_summary", channel: "qq", scheduledAt, status: "pending", dedupeKey: `daily-summary:${date}:qq`, importanceReasons: decision.reasons }).onConflictDoNothing();
 }
 
 async function dispatchReminders(bot: QQBot) {
@@ -32,7 +34,7 @@ async function dispatchReminders(bot: QQBot) {
       const [claimed] = await db.update(reminders).set({ status: "sending", updatedAt: new Date() }).where(and(eq(reminders.id, reminder.id), eq(reminders.status, "pending"))).returning({ id: reminders.id });
       if (!claimed) continue;
       try {
-        await bot.sendText({ scope: "c2c", targetId: process.env.QQBOT_OWNER_USER_ID! }, reminderMessage(reminder.kind, reminder.taskId));
+        await bot.sendText({ scope: "c2c", targetId: process.env.QQBOT_OWNER_USER_ID! }, reminderMessage(reminder.kind, reminder.taskId, reminder.importanceReasons ?? []));
         await db.update(reminders).set({ status: "sent", sentAt: new Date(), updatedAt: new Date() }).where(eq(reminders.id, reminder.id));
       } catch (error) {
         await db.update(reminders).set({ status: "failed", error: error instanceof Error ? error.message : "unknown error", updatedAt: new Date() }).where(eq(reminders.id, reminder.id));
@@ -161,6 +163,7 @@ if (!qqIsConfigured()) {
         id: `qq-${message.messageId}`,
         date: plan.targetDate ?? date,
         status: "todo",
+        reminderPolicy: "auto",
         movable: plan.task.kind !== "fixed",
         ...plan.task,
         preferredStartMinutes: plan.task.preferredStartMinutes ?? undefined,

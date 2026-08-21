@@ -146,6 +146,7 @@ function buildMoves(task: ScheduleTask, context: ScheduleContext, placement: Sch
       kind: block.kind,
       priority: "normal",
       status: "todo",
+      reminderPolicy: "auto",
       estimatedMinutes: block.durationMinutes,
       movable: true,
       preferredStartMinutes: block.startMinutes,

@@ -1,4 +1,8 @@
 import { z } from "zod";
+import { REMINDER_POLICIES } from "../domain/types";
+import { REMINDER_IMPORTANCE_REASONS } from "../domain/reminder-policy";
+
+export const reminderPolicySchema = z.enum(REMINDER_POLICIES);
 
 export const scheduleDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "date must use YYYY-MM-DD").refine((value) => {
   const [year, month, day] = value.split("-").map(Number);
@@ -14,6 +18,7 @@ export const scheduleTaskSchema = z.object({
   kind: z.enum(["fixed", "flexible", "floating"]),
   priority: z.enum(["low", "normal", "high"]),
   status: z.enum(["todo", "doing", "blocked", "done"]),
+  reminderPolicy: reminderPolicySchema.default("auto"),
   estimatedMinutes: scheduleMinutesSchema.refine((value) => value > 0, "duration must be positive"),
   movable: z.boolean(),
   preferredStartMinutes: scheduleMinutesSchema.optional(),
@@ -54,3 +59,17 @@ export const scheduleSnapshotSchema = z.object({
 });
 
 export const scheduleCommandSchema = z.object({ task: scheduleTaskSchema });
+
+export const reminderSummarySchema = z.object({
+  id: z.string().min(1),
+  taskId: z.string().nullable().optional(),
+  kind: z.enum(["start", "schedule_change", "daily_summary"]),
+  channel: z.enum(["qq", "pwa"]),
+  importanceReasons: z.array(z.enum(REMINDER_IMPORTANCE_REASONS)).nullable().optional(),
+  scheduledAt: z.string(),
+  status: z.enum(["pending", "sending", "sent", "failed", "cancelled"]),
+  error: z.string().nullable().optional(),
+});
+
+export const reminderListResponseSchema = z.object({ reminders: z.array(reminderSummarySchema) });
+export type ReminderSummary = z.infer<typeof reminderSummarySchema>;

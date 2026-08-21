@@ -4,6 +4,8 @@ export const DEFAULT_BUFFER_MINUTES = 15;
 export type ScheduleKind = "fixed" | "flexible" | "floating";
 export type TaskStatus = "todo" | "doing" | "blocked" | "done";
 export type Priority = "low" | "normal" | "high";
+export const REMINDER_POLICIES = ["auto", "always", "never"] as const;
+export type ReminderPolicy = typeof REMINDER_POLICIES[number];
 export type SchedulingMode = "rules" | "optimize";
 
 export type TimeRange = {
@@ -27,6 +29,7 @@ export type ScheduleTask = {
   kind: ScheduleKind;
   priority: Priority;
   status: TaskStatus;
+  reminderPolicy: ReminderPolicy;
   estimatedMinutes: number;
   movable: boolean;
   preferredStartMinutes?: number;

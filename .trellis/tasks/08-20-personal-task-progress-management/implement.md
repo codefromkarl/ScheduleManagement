@@ -59,12 +59,40 @@ Implementation is in progress. The local Web/PWA flow now covers the core schedu
 - [x] Add structured proposal handling, confirmation, transaction application, audit, and undo.
 - [x] Add an explicit, user-accepted duration suggestion from recent non-seed tasks, with visible edit/reset controls; silent automatic learning remains intentionally deferred.
 
+### 4.1 Daily execution refinement
+
+- [x] Remove duplicate optimization confirmation rendering and show an exact conflict marker/reason for failed click or drag targets.
+- [x] Let scheduled flexible/floating blocks drag through the existing rules-only reschedule API; add an exact-time click flow for every scheduled task while preserving fixed-block drag protection.
+- [x] Add transactional “按规则安排全部” with deterministic priority/deadline ordering, one ChangeSet, no existing moves, retained leftovers, and undo.
+- [x] Add transactional daily close for incomplete non-fixed tasks: move to tomorrow unplanned or remain today unplanned; preserve fixed tasks and support undo.
+- [x] Add Playwright with a dedicated SQLite database/server and desktop/mobile regressions for the approved scheduling boundaries.
+
 ### 5. QQ Bot adapter
 
 - [ ] Implement and verify the official C2C transport behind a channel adapter; the official SDK worker entrypoint and owner allowlist are present, but no credentials are available for a real smoke test.
 - [x] Bind one QQ identity, reject unauthorized senders, and persistently deduplicate external message IDs; real transport credentials and sandbox verification remain open.
 - [x] Reuse the website command service and return concise schedule results, questions, and confirmations.
 - [ ] Add sandbox integration tests and a real account smoke test without exposing credentials.
+
+### 4.2 Cross-date planning and explainability
+
+- [x] Add a read-only all-date unplanned projection and Dashboard Sheet grouped into overdue/today/tomorrow/this-week/later with date jump actions.
+- [x] Add pure daily capacity projection plus a bounded range API and compact weekly capacity summary with explainable healthy/tight/impossible/unknown states.
+- [x] Replace the fixed 08:00–19:00 coordinate assumptions with one snapshot-derived timeline range shared by labels, blocks, now line, drag/drop, and conflict markers.
+- [x] Extract detailed schedule-change preview and unplanned/capacity/timeline presentation components from the Dashboard without changing mutation ownership.
+- [x] Extend Vitest and isolated Playwright for cross-date groups, capacity, early/late timeline expansion, and concrete before/after move preview rows.
+
+### 4.3 Responsive Dashboard hierarchy and important reminders
+
+- [x] Recompose the desktop Dashboard as a week-planning workspace with the weekly schedule as the primary surface and actionable unplanned/capacity/risk context using the available wide-screen space.
+- [x] Recompose the mobile Dashboard as a today-execution workspace with the selected date, next action, and day timeline first; add previous-day, next-day, and explicit-date touch navigation while preserving manual day/week switching.
+- [x] Implement the confirmed deterministic importance policy before enqueueing QQ reminders: high-priority/fixed starts at T-15 minutes, changes affecting high-priority/fixed work, and daily summaries at 09:00 Asia/Shanghai only when overdue/blocked/impossible-capacity/unhandled-high-priority risk exists. Keep filtering separate from QQ transport enablement and preserve existing deduplication/retry behavior.
+- [x] Add a migrated, typed task `reminderPolicy` field (`auto | always | never`) with `auto` as the backward-compatible default; thread it through SQLite/in-memory stores, task contracts, update API, recurrence materialization, exports, and audit snapshots.
+- [x] Apply task overrides before reminder enqueue: `always` enables task-start/task-change eligibility, `never` suppresses task-specific start/change events, and neither value mutates priority, kind, or scheduling constraints. Preserve system-level aggregate capacity risk summaries.
+- [x] Add settings copy and controls that expose whether QQ reminders are configured and which important reminder categories are enabled.
+- [x] Add the three-state task reminder control under advanced task details with truthful QQ-unconfigured copy and no dependency on drag/drop.
+- [x] Extend isolated Playwright coverage for desktop week default, desktop planning context, mobile today default, mobile date switching, and reminder-policy visibility without requiring live QQ credentials.
+- [x] Add focused domain/store/API tests for auto eligibility, always/never overrides, 09:00 Asia/Shanghai conditional summaries, recurrence inheritance, deduplication, and retry preservation.
 
 ### 6. Reminders and background work
 
@@ -101,6 +129,9 @@ Commands depend on the selected scaffold, but the intended gates are:
 - Passed: after the explicit no-password switch, unauthenticated loopback and LAN Dashboard/schedule requests return `200`, `/login` redirects to `/`, `/api/status` reports `authDisabled: true`, and a fresh Chrome page opens the Dashboard without a login card; the profile menu truthfully shows “当前无需密码”.
 - Passed (2026-08-21): `pnpm test` (31/31), lint, TypeScript, SQLite schema check, production build, Compose config, and Trellis validation. Isolated API smokes proved normal no-slot persistence, no-move behavior, exact conflict refusal, click/drop placement, optimize preview immutability, explicit confirmation, and 15-minute buffer preservation.
 - Passed (2026-08-21): Chrome desktop drag and click-to-time both moved a temporary unplanned task to exactly `14:30` and persisted the same SQLite block; Chrome 390px showed the tray before the calendar, day mode, touch-sized “选择时间 / AI 优化” controls, hidden drag grip, and no horizontal overflow. All temporary tasks and 14 test-only ChangeSets were removed after validation.
+- Passed (2026-08-21 refinement): 33/33 Vitest checks and 3/3 isolated Playwright scenarios pass. Playwright covers rules batch plus whole-batch undo, scheduled drag/click reschedule, rejected-target marker, daily-close confirmation plus undo, and 390px mobile overflow. Production API smoke separately proved batch/daily-close transaction scope and undo, then removed all exact test task/reminder/ChangeSet IDs.
+- Passed: final SQLite `quick_check = ok`, zero foreign-key violations, production build (24 routes), Compose config, healthy app/PWA worker, loopback/LAN HTTP `200`, and invalid batch input `400`.
+- Passed (2026-08-21 responsive planning/reminders): 42/42 Vitest, lint, TypeScript, Drizzle check, two new migrations, isolated migrate/seed, production build (26 static pages/routes), Compose config, and 5/5 Playwright. Real Chrome rendering verified desktop week planning rail and 390px today execution/date navigation against an isolated SQLite database; task reminder policy round-tripped through the API and recurrence materialization inherited its template policy without live QQ credentials.
 - Expected but not passed: real cloud AI (the available `OPENAI_API_KEY` returned HTTP 401), real QQ C2C private message/reply/reminder, and real mobile push permission/delivery. QQ worker exits clearly until its three credentials are provided.
 - Follow-up gaps: cloud AI/QQ/real push credentials, private HTTPS authorization, dedicated project health page, silent AI preference learning beyond the explicit suggestion, daily risk detail beyond the Dashboard link, and randomized property/idempotency tests remain open.
 

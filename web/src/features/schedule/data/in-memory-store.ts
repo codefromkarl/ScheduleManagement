@@ -1,7 +1,8 @@
 import { findScheduleProposal, placementToBlock } from "../domain/scheduler";
-import type { ScheduleTask } from "../domain/types";
+import type { ScheduledBlock, ScheduleTask } from "../domain/types";
+import { rankUnplannedTasks } from "../domain/unplanned";
 import { createDemoSnapshot } from "./demo-snapshot";
-import type { InsertTaskResult, RescheduleTaskOptions, RescheduleTaskResult, ScheduleExistingTaskOptions, ScheduleExistingTaskResult, ScheduleMutationOptions, ScheduleStore } from "./store-types";
+import type { ArrangeUnplannedResult, DailyCloseAction, DailyCloseResult, InsertTaskResult, RescheduleTaskOptions, RescheduleTaskResult, ScheduleExistingTaskOptions, ScheduleExistingTaskResult, ScheduleMutationOptions, ScheduleStore } from "./store-types";
 import type { ScheduleSnapshot } from "./types";
 import { randomUUID } from "node:crypto";
 
@@ -11,14 +12,47 @@ function cloneSnapshot(snapshot: ScheduleSnapshot): ScheduleSnapshot {
   return structuredClone(snapshot);
 }
 
+function nextDate(date: string) {
+  const value = new Date(`${date}T00:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + 1);
+  return value.toISOString().slice(0, 10);
+}
+
+type InMemoryChange = {
+  kind: "insert" | "place" | "reschedule" | "arrange_batch" | "daily_close";
+  date: string;
+  taskId?: string;
+  taskIds?: string[];
+  targetDate?: string;
+  blockId?: string;
+  blockIds?: string[];
+  blocks?: ScheduledBlock[];
+  fromStartMinutes?: number;
+  moves: Array<{ blockId: string; fromStartMinutes: number }>;
+};
+
 export class InMemoryScheduleStore implements ScheduleStore {
   private readonly snapshots = new Map<string, ScheduleSnapshot>();
-  private readonly changes = new Map<string, { kind: "insert" | "place" | "reschedule"; date: string; taskId: string; blockId?: string; fromStartMinutes?: number; moves: Array<{ blockId: string; fromStartMinutes: number }> }>();
+  private readonly changes = new Map<string, InMemoryChange>();
 
   async getSnapshot(date: string) {
     const snapshot = this.snapshots.get(date) ?? createDemoSnapshot(date);
     this.snapshots.set(date, snapshot);
     return cloneSnapshot(snapshot);
+  }
+
+  async getUnplannedTasks() {
+    const seen = new Set<string>();
+    const result: ScheduleTask[] = [];
+    for (const snapshot of this.snapshots.values()) {
+      const scheduled = new Set(snapshot.blocks.map((block) => block.taskId));
+      for (const task of snapshot.tasks) {
+        if (task.status === "done" || scheduled.has(task.id) || seen.has(task.id)) continue;
+        seen.add(task.id);
+        result.push(structuredClone(task));
+      }
+    }
+    return rankUnplannedTasks(result);
   }
 
   async insertTask(task: ScheduleTask, options: ScheduleMutationOptions = {}): Promise<InsertTaskResult> {
@@ -106,6 +140,53 @@ export class InMemoryScheduleStore implements ScheduleStore {
     return { taskId, date, proposal: { ...proposal, decision: "auto" }, snapshot: cloneSnapshot(current), changeSetId };
   }
 
+  async arrangeUnplanned(date: string): Promise<ArrangeUnplannedResult> {
+    const current = await this.getSnapshot(date);
+    const scheduledIds = new Set(current.blocks.map((block) => block.taskId));
+    const queue = rankUnplannedTasks(current.tasks.filter((task) => task.status !== "done" && !scheduledIds.has(task.id)));
+    const workingBlocks = [...current.blocks];
+    const blocks: ScheduledBlock[] = [];
+
+    for (const task of queue) {
+      const proposal = findScheduleProposal(task, { date, availability: current.availability, unavailable: current.unavailable, existing: workingBlocks, bufferMinutes: current.bufferMinutes, mode: "rules" });
+      if (proposal.decision !== "auto" || !proposal.placement) continue;
+      const block = placementToBlock(task, proposal.placement);
+      blocks.push(block);
+      workingBlocks.push(block);
+    }
+
+    if (blocks.length === 0) return { date, arrangedTaskIds: [], remainingTaskIds: queue.map((task) => task.id), snapshot: current };
+    current.blocks.push(...blocks);
+    this.snapshots.set(date, current);
+    const changeSetId = randomUUID();
+    this.changes.set(changeSetId, { kind: "arrange_batch", date, taskIds: blocks.map((block) => block.taskId), blockIds: blocks.map((block) => block.id), moves: [] });
+    const arrangedIds = new Set(blocks.map((block) => block.taskId));
+    return { date, arrangedTaskIds: [...arrangedIds], remainingTaskIds: queue.filter((task) => !arrangedIds.has(task.id)).map((task) => task.id), snapshot: cloneSnapshot(current), changeSetId };
+  }
+
+  async closeDay(date: string, action: DailyCloseAction): Promise<DailyCloseResult> {
+    const current = await this.getSnapshot(date);
+    const taskIds = current.tasks.filter((task) => task.status !== "done" && task.kind !== "fixed").map((task) => task.id);
+    const taskIdSet = new Set(taskIds);
+    const blocks = current.blocks.filter((block) => taskIdSet.has(block.taskId));
+    const targetDate = action === "move_tomorrow" ? nextDate(date) : date;
+    if (taskIds.length === 0) return { date, targetDate, action, affectedTaskIds: [], snapshot: current };
+
+    current.blocks = current.blocks.filter((block) => !taskIdSet.has(block.taskId));
+    if (action === "move_tomorrow") {
+      const movedTasks = current.tasks.filter((task) => taskIdSet.has(task.id)).map((task) => ({ ...task, date: targetDate }));
+      current.tasks = current.tasks.filter((task) => !taskIdSet.has(task.id));
+      const target = await this.getSnapshot(targetDate);
+      target.tasks.push(...movedTasks);
+      this.snapshots.set(targetDate, target);
+    }
+    this.snapshots.set(date, current);
+    const changeSetId = randomUUID();
+    this.changes.set(changeSetId, { kind: "daily_close", date, targetDate, taskIds, blocks: structuredClone(blocks), moves: [] });
+    const snapshot = action === "move_tomorrow" ? await this.getSnapshot(targetDate) : current;
+    return { date, targetDate, action, affectedTaskIds: taskIds, snapshot: cloneSnapshot(snapshot), changeSetId };
+  }
+
   async rescheduleTask(taskId: string, date: string, startMinutes: number, options: RescheduleTaskOptions = {}): Promise<RescheduleTaskResult> {
     const current = await this.getSnapshot(date);
     const task = current.tasks.find((item) => item.id === taskId);
@@ -127,7 +208,7 @@ export class InMemoryScheduleStore implements ScheduleStore {
     return { taskId, date, startMinutes, proposal: { ...proposal, decision: "auto" }, snapshot: cloneSnapshot(current), changeSetId };
   }
 
-  async updateTask(taskId: string, changes: Partial<Pick<ScheduleTask, "title" | "status" | "priority" | "notes">>) {
+  async updateTask(taskId: string, changes: Partial<Pick<ScheduleTask, "title" | "status" | "priority" | "reminderPolicy" | "notes">>) {
     for (const [date, snapshot] of this.snapshots.entries()) {
       const task = snapshot.tasks.find((item) => item.id === taskId);
       if (!task) continue;
@@ -158,6 +239,20 @@ export class InMemoryScheduleStore implements ScheduleStore {
       snapshot.blocks = snapshot.blocks.filter((block) => block.taskId !== change.taskId);
     } else if (change.kind === "place") {
       snapshot.blocks = snapshot.blocks.filter((block) => block.id !== change.blockId);
+    } else if (change.kind === "arrange_batch") {
+      const blockIds = new Set(change.blockIds ?? []);
+      snapshot.blocks = snapshot.blocks.filter((block) => !blockIds.has(block.id));
+    } else if (change.kind === "daily_close") {
+      const taskIds = new Set(change.taskIds ?? []);
+      if (change.targetDate && change.targetDate !== change.date) {
+        const target = await this.getSnapshot(change.targetDate);
+        const movedTasks = target.tasks.filter((task) => taskIds.has(task.id)).map((task) => ({ ...task, date: change.date }));
+        target.tasks = target.tasks.filter((task) => !taskIds.has(task.id));
+        target.blocks = target.blocks.filter((block) => !taskIds.has(block.taskId));
+        snapshot.tasks.push(...movedTasks);
+        this.snapshots.set(change.targetDate, target);
+      }
+      snapshot.blocks.push(...(change.blocks ?? []));
     } else if (change.blockId && change.fromStartMinutes !== undefined) {
       const block = snapshot.blocks.find((item) => item.id === change.blockId);
       if (block) block.startMinutes = change.fromStartMinutes;

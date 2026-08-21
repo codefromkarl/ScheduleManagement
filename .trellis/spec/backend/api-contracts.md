@@ -10,6 +10,10 @@ The first Next App Router API boundary is `/api/schedule`. It normalizes schedul
 GET  /api/schedule?date=YYYY-MM-DD
 POST /api/schedule
 POST /api/tasks/:id/schedule
+POST /api/schedule/arrange
+POST /api/schedule/daily-close
+GET  /api/tasks/unplanned
+GET  /api/capacity?from=YYYY-MM-DD&to=YYYY-MM-DD
 ```
 
 The current implementation is in `web/src/app/api/schedule/route.ts` and `web/src/app/api/tasks/[id]/schedule/route.ts`. The active local deployment uses the SQLite/LibSQL adapter with the in-memory adapter retained only as a no-database development fallback.
@@ -62,6 +66,19 @@ The current implementation is in `web/src/app/api/schedule/route.ts` and `web/sr
 - `422`: the exact drop/click target is unsafe or no optimized candidate exists; the task remains unplanned.
 - `400`: rules mode omitted `startMinutes`, or date/time/mode failed Zod validation.
 
+### POST batch rules and daily close
+
+- `POST /api/schedule/arrange` accepts `{ date }` and returns `{ arrangedTaskIds, remainingTaskIds, snapshot, changeSetId? }`. It fills only empty rules-safe slots, never moves existing blocks, and records all successful placements in one reversible ChangeSet.
+- `POST /api/schedule/daily-close` accepts `{ date, action: "unplan" | "move_tomorrow" }` and returns `{ date, targetDate, action, affectedTaskIds, snapshot, changeSetId? }`.
+- Daily close affects only incomplete non-fixed tasks. `unplan` deletes their blocks but retains their date; `move_tomorrow` deletes blocks and changes their date by one calendar day. Fixed tasks are unchanged.
+- An empty batch returns `200` without a ChangeSet or hidden mutation.
+
+### Read-only planning projections
+
+- `GET /api/tasks/unplanned` returns every active task without any schedule block as `{ tasks: ScheduleTask[] }`; ordering is priority, deadline, title, then stable ID. Group labels remain a client projection relative to the Shanghai current date.
+- `GET /api/capacity` accepts an inclusive 1–31 day range and returns `{ days: DailyCapacity[], totals }`.
+- Each capacity day includes unfinished/scheduled/unplanned/free/slack/deficit minutes, deadline risk count, `healthy | tight | impossible | unknown`, and one deterministic reason. The projection never invokes AI or applies a schedule change.
+
 All payloads are decoded from `unknown` with the shared Zod contract in `src/features/schedule/data/contract.ts`. The client validates the returned snapshot again before using it for display.
 
 ## 4. Validation & Error Matrix
@@ -76,6 +93,11 @@ All payloads are decoded from `unknown` with the shared Zod contract in `src/fea
 | Rules-mode click/drop conflicts | `422`; preserve the unplanned task and every existing block |
 | Explicit optimize must move elastic work | `409`; return a preview and require `confirm: true` |
 | Fixed block/deadline prevents placement | `422`; never move the fixed block |
+| Batch rules queue has partial capacity | `200`; place the safe prefix/candidates, return leftovers, and create one ChangeSet |
+| Daily close includes fixed/done tasks | Exclude them from `affectedTaskIds`; preserve their rows and blocks |
+| Any write in batch/daily-close fails | Roll back the whole transaction and return `409` |
+| Capacity range is reversed or exceeds 31 days | `400 INVALID_REQUEST` |
+| Cross-date/capacity storage read fails | `503` with a stable error envelope; never return an empty success |
 | Client cannot parse a successful snapshot | Treat response as unavailable; do not render it as an empty schedule |
 
 ## 5. Good / Base / Bad Cases
@@ -83,6 +105,7 @@ All payloads are decoded from `unknown` with the shared Zod contract in `src/fea
 - Good: the API validates a task, calls `findScheduleProposal`, and returns a typed proposal without allowing the request body to set a start block directly.
 - Base: the active Compose deployment reads and writes the shared SQLite file; the in-memory snapshot is used only when `DATABASE_URL` is intentionally absent for local development.
 - Bad: returning `422` without persisting a valid no-slot task, letting a drag handler edit client state directly, or treating ordinary text as optimize authorization.
+- Bad: looping over HTTP mutations from the browser for “arrange all”, or creating one ChangeSet per task in a user-visible batch.
 
 ## 6. Tests Required
 
@@ -90,6 +113,9 @@ All payloads are decoded from `unknown` with the shared Zod contract in `src/fea
 - Assert no-slot `POST /api/schedule` persists exactly one task without a block and moves no existing block.
 - Assert click/drop `422` leaves the task unplanned and optimize `409` leaves every block unchanged until confirmation.
 - Assert the client parser rejects missing or malformed snapshot fields.
+- Assert batch arrange uses priority/deadline/title order, moves no existing block, retains leftovers, and one undo removes every inserted batch block without deleting tasks.
+- Assert daily close preserves fixed/done tasks, both actions are reversible, and calendar dates advance without local-time drift.
+- Assert all-date unplanned excludes scheduled/done tasks and capacity returns deterministic healthy/tight/impossible/unknown states for bounded date ranges.
 - Repository integration tests run against a temporary SQLite file and must cover transaction rollback, reminder foreign-key ordering, JSON/timestamp mappings, and atomic claims across two clients.
 
 ## 8. Related mutation contracts
@@ -130,4 +156,10 @@ const parsed = scheduleCommandSchema.safeParse(await request.json());
 if (!parsed.success) return invalidRequest();
 const result = await scheduleStore.insertTask(parsed.data.task, { mode: "rules" });
 return responseForProposal(result);
+```
+
+```ts
+// Correct: one store transaction owns the batch and one ChangeSet.
+const result = await scheduleStore.arrangeUnplanned(parsed.data.date);
+return NextResponse.json(result);
 ```

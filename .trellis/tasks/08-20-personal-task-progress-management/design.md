@@ -141,7 +141,7 @@ Ordinary chat messages do not authorize reordering. AI reordering is entered onl
 
 Use the official QQ Bot application model rather than personal-account automation. The first version should bind one allowlisted QQ identity to the user's account and ignore or reject other senders. Normalize incoming C2C messages into the same command envelope used by website chat.
 
-The QQ adapter must handle message IDs, duplicate delivery, sender authorization, rate limits, retries, and concise replies. Detailed change previews should link to the private Web app when text is too long. QQ will be the primary reminder channel.
+The QQ adapter must handle message IDs, duplicate delivery, sender authorization, rate limits, retries, and concise replies. Detailed change previews should link to the private Web app when text is too long. QQ will be the primary channel for important reminders, but channel enablement must remain separate from reminder-importance policy so ordinary low-risk state changes are not sent indiscriminately.
 
 QQ reordering requires a strict command prefix: “优化日程” or “AI 重排”. Messages without one of these prefixes remain ordinary task commands and may use only no-move deterministic placement.
 
@@ -151,9 +151,25 @@ The exact QQ transport (long-lived connection or webhook), private-message inten
 
 PWA notification is optional per user and secondary to QQ. It consumes the same reminder events and deduplication keys. Browser permission denial or service-worker failure must not affect task state.
 
+### Reminder importance policy
+
+Reminder importance is a deterministic domain policy evaluated before channel delivery. Enabling QQ does not itself make every reminder eligible for QQ.
+
+- Start reminders are important when the task priority is `high` or the scheduled block is `fixed`; eligible reminders fire 15 minutes before the block starts.
+- Schedule-change reminders are important only when at least one affected task is high priority or one affected block is fixed.
+- Daily summaries are generated only when the selected day contains an overdue task, a blocked task, an impossible capacity projection, or an unhandled high-priority task. The default dispatch time is 09:00 in `Asia/Shanghai`; date and time calculations must not inherit the host timezone.
+- Ordinary task completion, ordinary low-risk rescheduling, and normal/low non-fixed task starts remain visible in Web history but do not enqueue QQ reminders by default.
+
+The policy result should include a stable reason/category so Settings and reminder history can explain why a message was or was not eligible. Channel delivery continues to own authorization, deduplication, retries, and transport failures; it must not reimplement importance decisions.
+
+Each task stores a `reminderPolicy` value with `auto`, `always`, and `never`; existing and newly created tasks default to `auto`. `always` makes task-start and task-affecting schedule-change events eligible even when the automatic rule would not. `never` suppresses task-specific start and schedule-change events. System-level capacity risk remains eligible for the aggregate daily summary because it describes the whole schedule rather than only one task. Recurring occurrences inherit the template policy when materialized, while a future occurrence-specific override may change only that occurrence.
+
+The field belongs to the task domain and typed task API, not the QQ adapter. The task detail surface exposes it under advanced settings, using user-facing labels `自动`, `强制提醒`, and `不提醒`; changing it must not mutate priority, kind, or scheduling constraints.
+
 ## Frontend Information Architecture
 
-- Dashboard: desktop defaults to week view; mobile defaults to day view. Both switch between day and week.
+- Dashboard: desktop defaults to a week-planning workspace that uses the wide viewport for the weekly schedule plus actionable unplanned/capacity/risk context. Mobile defaults to a today-execution workspace with the current date, next action, and day timeline first. Both can switch day/week modes without changing schedule data.
+- Mobile date navigation: day mode always exposes previous day, next day, and explicit date selection as touch targets. Selecting another date preserves day mode unless the user explicitly switches to week mode.
 - Unplanned tray: a compact Dashboard section above the timeline, hidden when empty, showing three priority/deadline-ranked tasks by default with expand, exact-time, and explicit AI-optimization actions.
 - AI chat: command entry, parsed intent, candidate plans, confirmation, and undo.
 - Project view: tasks, weighted progress, health, blockers, and recent changes.
@@ -161,9 +177,21 @@ PWA notification is optional per user and secondary to QQ. It consumes the same 
 - Settings: availability, do-not-disturb, buffer, AI preferences, notification channels, account, backup, and provider configuration.
 - Change history: searchable list of AI and manual changes with reversible recent operations.
 
-The responsive layout should keep the calendar and one primary action visible on mobile; advanced editing can open a bottom sheet or dedicated detail page.
+The responsive layout should keep the selected date, calendar, and one primary action visible on mobile; advanced editing can open a bottom sheet or dedicated detail page. Desktop planning context must not be hidden entirely behind an activity sheet when the same information is needed to make weekly scheduling decisions.
 
 Desktop unplanned cards may use native drag-and-drop onto the day timeline. The drop coordinate is converted to a 15-minute-aligned exact start and sent through the same typed reschedule/place command as the accessible click-to-select-time path. Mobile and keyboard users must be able to complete the same placement without dragging. Invalid drops never choose a different slot implicitly and leave the task unplanned.
+
+Scheduled flexible/floating blocks use the existing exact reschedule command for drag and click placement; fixed blocks expose click-to-edit only and do not set a drag payload. A rejected exact target preserves the original block and returns enough proposal data for the Dashboard to render a temporary red conflict marker at the attempted time.
+
+Batch rules scheduling is a store-owned transaction: derive unplanned tasks from one snapshot, sort by priority/deadline/title, simulate rules-only placement against a growing working block set, insert successful blocks/reminders in one transaction, and record one reversible ChangeSet. Daily close is also transactional and applies only to incomplete non-fixed tasks; it removes their blocks and optionally changes their date to tomorrow while retaining task identity.
+
+Playwright starts a dedicated Next server against `data/goalset-e2e.db`, migrates that file before launch, uses unique task IDs/dates, and cleans API fixtures. It must never point at the personal `data/goalset.db` by default.
+
+Cross-date unplanned reads remain read-only projections: the store returns all active tasks without any schedule block, the API groups nothing, and the client applies calendar-relative groups so labels remain consistent with the current Shanghai date. Capacity is a pure snapshot projection per date, with range requests capped to 31 dates.
+
+The timeline range is a shared value object derived from the snapshot. Start/end are whole-hour aligned, always include the default 08:00–19:00 range, and expand for earlier/later availability, blackouts, blocks, or attempted conflict markers. Rendering, current-time position, drag coordinate conversion, and conflict position all consume this same range.
+
+Adjustment previews are feature components fed by typed proposal moves. Routes/models still own no display strings; the Dashboard resolves block IDs to task titles and passes plain preview rows into the component. Model text must never be used as the source of before/after times.
 
 ## UI Component Strategy
 

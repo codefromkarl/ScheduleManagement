@@ -40,6 +40,7 @@ export async function POST(request: Request) {
       id: `ai-${crypto.randomUUID()}`,
       date: targetDate,
       status: "todo" as const,
+      reminderPolicy: "auto" as const,
       movable: plan.task.kind !== "fixed",
       ...plan.task,
       preferredStartMinutes: plan.task.preferredStartMinutes ?? undefined,

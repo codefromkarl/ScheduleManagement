@@ -12,6 +12,7 @@ function task(overrides: Partial<ScheduleTask> = {}): ScheduleTask {
     kind: "flexible",
     priority: "normal",
     status: "todo",
+    reminderPolicy: "auto",
     estimatedMinutes: 60,
     movable: true,
     ...overrides,

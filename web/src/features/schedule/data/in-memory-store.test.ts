@@ -13,6 +13,7 @@ describe("InMemoryScheduleStore unplanned flow", () => {
       kind: "fixed",
       status: "todo",
       priority: "normal",
+      reminderPolicy: "auto",
       estimatedMinutes: 15,
       movable: false,
       preferredStartMinutes: 9 * 60,
@@ -27,5 +28,35 @@ describe("InMemoryScheduleStore unplanned flow", () => {
     const placed = await store.scheduleTask(task.id, date, { mode: "rules", startMinutes: 14 * 60 + 30 });
     expect(placed.proposal.decision).toBe("auto");
     expect(placed.snapshot.blocks.find((block) => block.taskId === task.id)?.startMinutes).toBe(14 * 60 + 30);
+  });
+
+  it("arranges all currently safe unplanned tasks as one reversible batch", async () => {
+    const store = new InMemoryScheduleStore();
+    const date = "2026-08-21";
+    const task: ScheduleTask = { id: "batch-task", title: "批量待安排", date, kind: "flexible", status: "todo", priority: "high", reminderPolicy: "auto", estimatedMinutes: 60, movable: true, preferredStartMinutes: 9 * 60, deadlineMinutes: 10 * 60 };
+    const inserted = await store.insertTask(task);
+    expect(inserted.proposal.decision).toBe("no_slot");
+    await store.deleteTask("weekly-sync");
+
+    const arranged = await store.arrangeUnplanned(date);
+    expect(arranged.arrangedTaskIds).toEqual([task.id]);
+    expect(arranged.snapshot.blocks.find((block) => block.taskId === task.id)?.startMinutes).toBe(9 * 60);
+
+    const undone = await store.undoChangeSet(arranged.changeSetId!);
+    expect(undone.tasks.some((item) => item.id === task.id)).toBe(true);
+    expect(undone.blocks.some((block) => block.taskId === task.id)).toBe(false);
+  });
+
+  it("closes a day without moving fixed work and can undo the batch", async () => {
+    const store = new InMemoryScheduleStore();
+    const date = "2026-08-21";
+    const before = await store.getSnapshot(date);
+    const result = await store.closeDay(date, "unplan");
+    expect(result.affectedTaskIds.length).toBeGreaterThan(0);
+    expect(result.snapshot.blocks.every((block) => block.kind === "fixed" || !result.affectedTaskIds.includes(block.taskId))).toBe(true);
+    expect(result.snapshot.blocks.some((block) => block.kind === "fixed")).toBe(true);
+
+    const undone = await store.undoChangeSet(result.changeSetId!);
+    expect(undone.blocks).toHaveLength(before.blocks.length);
   });
 });

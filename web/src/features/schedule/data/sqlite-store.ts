@@ -1,23 +1,35 @@
-import { and, eq, inArray, like } from "drizzle-orm";
+import { and, eq, inArray, isNull, like, ne } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { getDb } from "@/server/db";
 import { findScheduleProposal, placementToBlock } from "../domain/scheduler";
 import type { ScheduleTask, ScheduledBlock } from "../domain/types";
+import { evaluateTaskReminder } from "../domain/reminder-policy";
+import { rankUnplannedTasks } from "../domain/unplanned";
 import { createDemoSnapshot } from "./demo-snapshot";
-import type { RescheduleTaskOptions, RescheduleTaskResult, ScheduleExistingTaskOptions, ScheduleExistingTaskResult, ScheduleMutationOptions, ScheduleStore, TaskUpdateAudit } from "./store-types";
+import type { ArrangeUnplannedResult, DailyCloseAction, DailyCloseResult, RescheduleTaskOptions, RescheduleTaskResult, ScheduleExistingTaskOptions, ScheduleExistingTaskResult, ScheduleMutationOptions, ScheduleStore, TaskUpdateAudit } from "./store-types";
 import type { ScheduleSnapshot } from "./types";
 import { applyOccurrenceOverrides, generateOccurrenceDates } from "../domain/recurrence";
 import { availabilityRules, changeSets, occurrenceOverrides, preferences, projects, recurrenceRules, reminders, scheduleBlocks, tasks, unavailableWindows, workspaces } from "@/server/db/schema";
 import { configuredReminderChannels, REMINDER_WORKSPACE_ID } from "@/server/reminders";
 
 const WORKSPACE_ID = REMINDER_WORKSPACE_ID;
+type ScheduleTransaction = Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0];
 
 function reminderTime(date: string, startMinutes: number) {
   const [year, month, day] = date.split("-").map(Number);
   return new Date(Date.UTC(year, month - 1, day, Math.floor(startMinutes / 60) - 8, startMinutes % 60));
 }
 
-async function enqueueStartReminder(tx: Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0], block: ScheduledBlock) {
+async function reminderTask(tx: ScheduleTransaction, taskId: string) {
+  const [task] = await tx.select().from(tasks).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, taskId))).limit(1);
+  return task;
+}
+
+async function enqueueStartReminder(tx: ScheduleTransaction, block: ScheduledBlock, knownTask?: ScheduleTask) {
+  const task = knownTask ?? await reminderTask(tx, block.taskId);
+  if (!task) return;
+  const decision = evaluateTaskReminder(task, "start");
+  if (!decision.eligible) return;
   const scheduledAt = reminderTime(block.date, Math.max(0, block.startMinutes - 15));
   const channels = configuredReminderChannels();
   if (channels.length === 0) return;
@@ -31,27 +43,45 @@ async function enqueueStartReminder(tx: Parameters<Parameters<ReturnType<typeof 
     scheduledAt,
     status: "pending" as const,
     dedupeKey: `start:${block.id}:${channel}`,
+    importanceReasons: decision.reasons,
   }))).onConflictDoNothing();
 }
 
-async function enqueueScheduleChangeReminder(tx: Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0], changeSetId: string, taskId?: string) {
+async function enqueueScheduleChangeReminder(tx: ScheduleTransaction, changeSetId: string, taskIds: string[]) {
+  const uniqueTaskIds = [...new Set(taskIds)];
+  if (uniqueTaskIds.length === 0) return;
+  const taskRows = await tx.select().from(tasks).where(and(eq(tasks.workspaceId, WORKSPACE_ID), inArray(tasks.id, uniqueTaskIds)));
+  const important = taskRows.map((task) => ({ task, decision: evaluateTaskReminder(task, "schedule_change") })).find((item) => item.decision.eligible);
+  if (!important) return;
   const channels = configuredReminderChannels();
   if (channels.length === 0) return;
   await tx.insert(reminders).values(channels.map((channel) => ({
     id: `change:${changeSetId}:${channel}`,
     workspaceId: WORKSPACE_ID,
-    taskId,
+    taskId: important.task.id,
     kind: "schedule_change" as const,
     channel,
     scheduledAt: new Date(),
     status: "pending" as const,
     dedupeKey: `change:${changeSetId}:${channel}`,
+    importanceReasons: important.decision.reasons,
   }))).onConflictDoNothing();
 }
 
 function weekdayFor(date: string) {
   const [year, month, day] = date.split("-").map(Number);
   return new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+}
+
+function nextDate(date: string) {
+  const value = new Date(`${date}T00:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + 1);
+  return value.toISOString().slice(0, 10);
+}
+
+function affectedTaskIds(primaryTaskId: string, movedBlockIds: Array<{ blockId: string }>, blocks: ScheduledBlock[]) {
+  const taskIds = movedBlockIds.flatMap((move) => blocks.find((block) => block.id === move.blockId)?.taskId ?? []);
+  return [primaryTaskId, ...taskIds];
 }
 
 function toTask(row: typeof tasks.$inferSelect): ScheduleTask {
@@ -62,6 +92,7 @@ function toTask(row: typeof tasks.$inferSelect): ScheduleTask {
     kind: row.kind,
     status: row.status,
     priority: row.priority,
+    reminderPolicy: row.reminderPolicy,
     estimatedMinutes: row.estimatedMinutes,
     movable: row.movable,
     preferredStartMinutes: row.preferredStartMinutes ?? undefined,
@@ -114,6 +145,7 @@ export async function seedDate(date: string) {
     kind: task.kind,
     status: task.status,
     priority: task.priority,
+    reminderPolicy: task.reminderPolicy,
     estimatedMinutes: task.estimatedMinutes,
     movable: task.movable,
     preferredStartMinutes: task.preferredStartMinutes,
@@ -213,16 +245,16 @@ export class SqliteScheduleStore implements ScheduleStore {
       const proposal = findScheduleProposal(occurrenceTask, { date, availability: current.availability, unavailable: current.unavailable, existing: contextBlocks, bufferMinutes: current.bufferMinutes });
       if (proposal.decision !== "auto" || !proposal.placement) {
         if (!isTemplateOccurrence && !current.tasks.some((task) => task.id === occurrenceTaskId)) {
-          await db.insert(tasks).values({ id: occurrenceTaskId, workspaceId: WORKSPACE_ID, projectId: occurrenceTask.projectId, title: occurrenceTask.title, date, kind: occurrenceTask.kind, status: occurrenceTask.status, priority: occurrenceTask.priority, estimatedMinutes: occurrenceTask.estimatedMinutes, movable: occurrenceTask.movable, preferredStartMinutes: occurrenceTask.preferredStartMinutes, deadlineMinutes: occurrenceTask.deadlineMinutes, notes: occurrenceTask.notes, source: "recurrence" }).onConflictDoNothing();
+          await db.insert(tasks).values({ id: occurrenceTaskId, workspaceId: WORKSPACE_ID, projectId: occurrenceTask.projectId, title: occurrenceTask.title, date, kind: occurrenceTask.kind, status: occurrenceTask.status, priority: occurrenceTask.priority, reminderPolicy: occurrenceTask.reminderPolicy, estimatedMinutes: occurrenceTask.estimatedMinutes, movable: occurrenceTask.movable, preferredStartMinutes: occurrenceTask.preferredStartMinutes, deadlineMinutes: occurrenceTask.deadlineMinutes, notes: occurrenceTask.notes, source: "recurrence" }).onConflictDoNothing();
         }
         continue;
       }
       const block = placementToBlock(occurrenceTask, proposal.placement);
       await db.transaction(async (tx) => {
         if (!isTemplateOccurrence && !currentBlock) {
-          await tx.insert(tasks).values({ id: occurrenceTaskId, workspaceId: WORKSPACE_ID, projectId: occurrenceTask.projectId, title: occurrenceTask.title, date, kind: occurrenceTask.kind, status: occurrenceTask.status, priority: occurrenceTask.priority, estimatedMinutes: occurrenceTask.estimatedMinutes, movable: occurrenceTask.movable, preferredStartMinutes: occurrenceTask.preferredStartMinutes, deadlineMinutes: occurrenceTask.deadlineMinutes, notes: occurrenceTask.notes, source: "recurrence" }).onConflictDoNothing();
+          await tx.insert(tasks).values({ id: occurrenceTaskId, workspaceId: WORKSPACE_ID, projectId: occurrenceTask.projectId, title: occurrenceTask.title, date, kind: occurrenceTask.kind, status: occurrenceTask.status, priority: occurrenceTask.priority, reminderPolicy: occurrenceTask.reminderPolicy, estimatedMinutes: occurrenceTask.estimatedMinutes, movable: occurrenceTask.movable, preferredStartMinutes: occurrenceTask.preferredStartMinutes, deadlineMinutes: occurrenceTask.deadlineMinutes, notes: occurrenceTask.notes, source: "recurrence" }).onConflictDoNothing();
           await tx.insert(scheduleBlocks).values({ id: block.id, workspaceId: WORKSPACE_ID, taskId: block.taskId, date, startMinutes: block.startMinutes, durationMinutes: block.durationMinutes, kind: block.kind, movable: block.movable }).onConflictDoNothing();
-          await enqueueStartReminder(tx, block);
+          await enqueueStartReminder(tx, block, occurrenceTask);
         } else if (!isTemplateOccurrence && currentBlock) {
           await tx.update(scheduleBlocks).set({ startMinutes: block.startMinutes, durationMinutes: block.durationMinutes, updatedAt: new Date() }).where(and(eq(scheduleBlocks.id, currentBlock.id), eq(scheduleBlocks.workspaceId, WORKSPACE_ID)));
           await tx.update(tasks).set({ estimatedMinutes: occurrenceTask.estimatedMinutes, preferredStartMinutes: occurrenceTask.preferredStartMinutes, updatedAt: new Date() }).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, occurrenceTaskId)));
@@ -238,6 +270,12 @@ export class SqliteScheduleStore implements ScheduleStore {
     await ensureWorkspace();
     await this.materializeRecurrences(date);
     return this.getRawSnapshot(date);
+  }
+
+  async getUnplannedTasks() {
+    const db = getDb();
+    const rows = await db.select({ task: tasks }).from(tasks).leftJoin(scheduleBlocks, and(eq(scheduleBlocks.workspaceId, WORKSPACE_ID), eq(scheduleBlocks.taskId, tasks.id))).where(and(eq(tasks.workspaceId, WORKSPACE_ID), ne(tasks.status, "done"), isNull(scheduleBlocks.id)));
+    return rankUnplannedTasks(rows.map((row) => toTask(row.task)));
   }
 
   async insertTask(task: ScheduleTask, options: ScheduleMutationOptions = {}) {
@@ -264,6 +302,7 @@ export class SqliteScheduleStore implements ScheduleStore {
           kind: task.kind,
           status: task.status,
           priority: task.priority,
+          reminderPolicy: task.reminderPolicy,
           estimatedMinutes: task.estimatedMinutes,
           movable: task.movable,
           preferredStartMinutes: task.preferredStartMinutes,
@@ -289,6 +328,7 @@ export class SqliteScheduleStore implements ScheduleStore {
         kind: task.kind,
         status: task.status,
         priority: task.priority,
+        reminderPolicy: task.reminderPolicy,
         estimatedMinutes: task.estimatedMinutes,
         movable: task.movable,
         preferredStartMinutes: task.preferredStartMinutes,
@@ -307,8 +347,8 @@ export class SqliteScheduleStore implements ScheduleStore {
         kind: block.kind,
         movable: block.movable,
       });
-      await enqueueStartReminder(tx, block);
-      await enqueueScheduleChangeReminder(tx, changeSetId, task.id);
+      await enqueueStartReminder(tx, block, task);
+      await enqueueScheduleChangeReminder(tx, changeSetId, affectedTaskIds(task.id, proposal.moves, current.blocks));
       await tx.insert(changeSets).values({ id: changeSetId, workspaceId: WORKSPACE_ID, source: options.source ?? "web", originalCommand: task.title, parsedIntent: task, beforeState: { date: task.date, taskId: null, moves: [] }, afterState: { date: task.date, taskId: task.id, moves: [] }, status: "applied" });
     });
     return { proposal, snapshot: await this.getSnapshot(task.date), changeSetId };
@@ -341,6 +381,7 @@ export class SqliteScheduleStore implements ScheduleStore {
         kind: task.kind,
         status: task.status,
         priority: task.priority,
+        reminderPolicy: task.reminderPolicy,
         estimatedMinutes: task.estimatedMinutes,
         movable: task.movable,
         preferredStartMinutes: task.preferredStartMinutes,
@@ -350,8 +391,8 @@ export class SqliteScheduleStore implements ScheduleStore {
       });
       const block = placementToBlock(task, placement);
       await tx.insert(scheduleBlocks).values({ id: block.id, workspaceId: WORKSPACE_ID, taskId: block.taskId, date: block.date, startMinutes: block.startMinutes, durationMinutes: block.durationMinutes, kind: block.kind, movable: block.movable });
-      await enqueueStartReminder(tx, block);
-      await enqueueScheduleChangeReminder(tx, changeSetId, task.id);
+      await enqueueStartReminder(tx, block, task);
+      await enqueueScheduleChangeReminder(tx, changeSetId, affectedTaskIds(task.id, proposal.moves, current.blocks));
       await tx.insert(changeSets).values({ id: changeSetId, workspaceId: WORKSPACE_ID, source: options.source ?? "web-confirmed", originalCommand: task.title, parsedIntent: task, beforeState: { date: task.date, taskId: null, moves: proposal.moves.map((move) => ({ blockId: move.blockId, fromStartMinutes: move.fromStartMinutes })) }, afterState: { date: task.date, taskId: task.id, moves: proposal.moves }, status: "applied" });
     });
     return { proposal: { ...proposal, decision: "auto" as const }, snapshot: await this.getSnapshot(task.date), changeSetId };
@@ -394,8 +435,8 @@ export class SqliteScheduleStore implements ScheduleStore {
       }
       await tx.update(tasks).set({ date, ...(options.startMinutes !== undefined ? { preferredStartMinutes: placement.startMinutes } : {}), updatedAt: new Date() }).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, taskId)));
       await tx.insert(scheduleBlocks).values({ id: block.id, workspaceId: WORKSPACE_ID, taskId, date, startMinutes: block.startMinutes, durationMinutes: block.durationMinutes, kind: block.kind, movable: block.movable });
-      await enqueueStartReminder(tx, block);
-      await enqueueScheduleChangeReminder(tx, changeSetId, taskId);
+      await enqueueStartReminder(tx, block, task);
+      await enqueueScheduleChangeReminder(tx, changeSetId, affectedTaskIds(taskId, proposal.moves, current.blocks));
       await tx.insert(changeSets).values({
         id: changeSetId,
         workspaceId: WORKSPACE_ID,
@@ -410,15 +451,91 @@ export class SqliteScheduleStore implements ScheduleStore {
     return { taskId, date, proposal: { ...proposal, decision: "auto" }, snapshot: await this.getSnapshot(date), changeSetId };
   }
 
-  async updateTask(taskId: string, changes: Partial<Pick<ScheduleTask, "title" | "status" | "priority" | "notes">>, audit: TaskUpdateAudit = {}) {
+  async arrangeUnplanned(date: string): Promise<ArrangeUnplannedResult> {
+    const current = await this.getSnapshot(date);
+    const scheduledIds = new Set(current.blocks.map((block) => block.taskId));
+    const queue = rankUnplannedTasks(current.tasks.filter((task) => task.status !== "done" && !scheduledIds.has(task.id)));
+    const workingBlocks = [...current.blocks];
+    const plannedBlocks: ScheduledBlock[] = [];
+
+    for (const task of queue) {
+      const proposal = findScheduleProposal(task, { date, availability: current.availability, unavailable: current.unavailable, existing: workingBlocks, bufferMinutes: current.bufferMinutes, mode: "rules" });
+      if (proposal.decision !== "auto" || !proposal.placement) continue;
+      const block = placementToBlock(task, proposal.placement);
+      plannedBlocks.push(block);
+      workingBlocks.push(block);
+    }
+
+    const arrangedTaskIds = plannedBlocks.map((block) => block.taskId);
+    const arrangedIds = new Set(arrangedTaskIds);
+    const remainingTaskIds = queue.filter((task) => !arrangedIds.has(task.id)).map((task) => task.id);
+    if (plannedBlocks.length === 0) return { date, arrangedTaskIds, remainingTaskIds, snapshot: current };
+
+    const changeSetId = randomUUID();
+    const db = getDb();
+    await db.transaction(async (tx) => {
+      for (const block of plannedBlocks) {
+        await tx.insert(scheduleBlocks).values({ id: block.id, workspaceId: WORKSPACE_ID, taskId: block.taskId, date: block.date, startMinutes: block.startMinutes, durationMinutes: block.durationMinutes, kind: block.kind, movable: block.movable });
+        await enqueueStartReminder(tx, block, current.tasks.find((task) => task.id === block.taskId));
+      }
+      await enqueueScheduleChangeReminder(tx, changeSetId, arrangedTaskIds);
+      await tx.insert(changeSets).values({
+        id: changeSetId,
+        workspaceId: WORKSPACE_ID,
+        source: "rules-batch",
+        originalCommand: `按规则安排全部：${arrangedTaskIds.length} 项`,
+        parsedIntent: { operation: "arrange_batch", date },
+        beforeState: { operation: "arrange_batch", date },
+        afterState: { operation: "arrange_batch", date, taskIds: arrangedTaskIds, blockIds: plannedBlocks.map((block) => block.id) },
+        status: "applied",
+      });
+    });
+    return { date, arrangedTaskIds, remainingTaskIds, snapshot: await this.getSnapshot(date), changeSetId };
+  }
+
+  async closeDay(date: string, action: DailyCloseAction): Promise<DailyCloseResult> {
+    const current = await this.getSnapshot(date);
+    const affectedTasks = current.tasks.filter((task) => task.status !== "done" && task.kind !== "fixed");
+    const affectedTaskIds = affectedTasks.map((task) => task.id);
+    const affectedIdSet = new Set(affectedTaskIds);
+    const affectedBlocks = current.blocks.filter((block) => affectedIdSet.has(block.taskId));
+    const targetDate = action === "move_tomorrow" ? nextDate(date) : date;
+    if (affectedTaskIds.length === 0) return { date, targetDate, action, affectedTaskIds, snapshot: current };
+
+    const changeSetId = randomUUID();
+    const db = getDb();
+    await db.transaction(async (tx) => {
+      await tx.delete(reminders).where(and(eq(reminders.workspaceId, WORKSPACE_ID), inArray(reminders.taskId, affectedTaskIds)));
+      if (affectedBlocks.length > 0) await tx.delete(scheduleBlocks).where(and(eq(scheduleBlocks.workspaceId, WORKSPACE_ID), inArray(scheduleBlocks.id, affectedBlocks.map((block) => block.id))));
+      if (action === "move_tomorrow") await tx.update(tasks).set({ date: targetDate, updatedAt: new Date() }).where(and(eq(tasks.workspaceId, WORKSPACE_ID), inArray(tasks.id, affectedTaskIds)));
+      await enqueueScheduleChangeReminder(tx, changeSetId, affectedTaskIds);
+      await tx.insert(changeSets).values({
+        id: changeSetId,
+        workspaceId: WORKSPACE_ID,
+        source: "daily-close",
+        originalCommand: action === "move_tomorrow" ? `今日收尾：${affectedTaskIds.length} 项移到明天待安排` : `今日收尾：${affectedTaskIds.length} 项留在今日待安排`,
+        parsedIntent: { operation: "daily_close", action, date, targetDate },
+        beforeState: { operation: "daily_close", action, date, targetDate, taskIds: affectedTaskIds, blocks: affectedBlocks },
+        afterState: { operation: "daily_close", action, date, targetDate, taskIds: affectedTaskIds },
+        status: "applied",
+      });
+    });
+    return { date, targetDate, action, affectedTaskIds, snapshot: await this.getSnapshot(targetDate), changeSetId };
+  }
+
+  async updateTask(taskId: string, changes: Partial<Pick<ScheduleTask, "title" | "status" | "priority" | "reminderPolicy" | "notes">>, audit: TaskUpdateAudit = {}) {
     const db = getDb();
     const [before] = await db.select().from(tasks).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, taskId)));
     if (!before) throw new Error("TASK_NOT_FOUND");
+    const [block] = await db.select().from(scheduleBlocks).where(and(eq(scheduleBlocks.workspaceId, WORKSPACE_ID), eq(scheduleBlocks.taskId, taskId))).limit(1);
     const changeSetId = randomUUID();
     await db.transaction(async (tx) => {
       await tx.update(tasks).set({ ...changes, updatedAt: new Date() }).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, taskId)));
-      await enqueueScheduleChangeReminder(tx, changeSetId, taskId);
-      await tx.insert(changeSets).values({ id: changeSetId, workspaceId: WORKSPACE_ID, source: audit.source ?? "web", originalCommand: audit.originalCommand ?? "manual task update", parsedIntent: changes, beforeState: { operation: "task_update", date: before.date, taskId, title: before.title, status: before.status, priority: before.priority, notes: before.notes }, afterState: { operation: "task_update", date: before.date, taskId, ...changes }, status: "applied" });
+      if (block && (changes.priority !== undefined || changes.reminderPolicy !== undefined)) {
+        await tx.delete(reminders).where(and(eq(reminders.workspaceId, WORKSPACE_ID), eq(reminders.taskId, taskId), eq(reminders.kind, "start"), eq(reminders.status, "pending")));
+        await enqueueStartReminder(tx, toBlock(block, { ...before, ...changes }), { ...toTask(before), ...changes });
+      }
+      await tx.insert(changeSets).values({ id: changeSetId, workspaceId: WORKSPACE_ID, source: audit.source ?? "web", originalCommand: audit.originalCommand ?? "manual task update", parsedIntent: changes, beforeState: { operation: "task_update", date: before.date, taskId, title: before.title, status: before.status, priority: before.priority, reminderPolicy: before.reminderPolicy, notes: before.notes }, afterState: { operation: "task_update", date: before.date, taskId, ...changes }, status: "applied" });
     });
     return this.getSnapshot(before.date);
   }
@@ -452,8 +569,8 @@ export class SqliteScheduleStore implements ScheduleStore {
         await tx.update(tasks).set({ date, updatedAt: new Date() }).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, taskId)));
         await tx.insert(scheduleBlocks).values({ id: targetBlock.id, workspaceId: WORKSPACE_ID, taskId, date, startMinutes: targetBlock.startMinutes, durationMinutes: targetBlock.durationMinutes, kind: targetBlock.kind, movable: targetBlock.movable });
       }
-      await enqueueStartReminder(tx, originDate === date ? { ...dbBlock, startMinutes: proposal.placement!.startMinutes } : targetBlock);
-      await enqueueScheduleChangeReminder(tx, changeSetId, taskId);
+      await enqueueStartReminder(tx, originDate === date ? { ...dbBlock, startMinutes: proposal.placement!.startMinutes } : targetBlock, task);
+      await enqueueScheduleChangeReminder(tx, changeSetId, affectedTaskIds(taskId, proposal.moves, current.blocks));
       await tx.insert(changeSets).values({ id: changeSetId, workspaceId: WORKSPACE_ID, source: options.source ?? "web-reschedule", originalCommand: task.title, parsedIntent: { taskId, date, startMinutes, mode: options.mode ?? "rules" }, beforeState: { operation: "reschedule", taskId, fromDate: originDate, toDate: date, blockId: block.id, fromStartMinutes: block.startMinutes, durationMinutes: block.durationMinutes, kind: block.kind, movable: block.movable, title: block.title, moves: proposal.moves.map((move) => ({ blockId: move.blockId, fromStartMinutes: move.fromStartMinutes })) }, afterState: { operation: "reschedule", taskId, fromDate: originDate, toDate: date, blockId: originDate === date ? block.id : targetBlock.id, toStartMinutes: proposal.placement!.startMinutes, moves: proposal.moves }, status: "applied" });
     });
     return { taskId, date, startMinutes, proposal: { ...proposal, decision: "auto" }, snapshot: await this.getSnapshot(date), changeSetId };
@@ -489,16 +606,37 @@ export class SqliteScheduleStore implements ScheduleStore {
     const rows = await db.select().from(changeSets).where(and(eq(changeSets.workspaceId, WORKSPACE_ID), eq(changeSets.id, changeSetId)));
     const change = rows[0];
     if (!change || change.status !== "applied") throw new Error("CHANGE_SET_NOT_FOUND");
-    const afterState = change.afterState as { operation?: string; date?: string; fromDate?: string; toDate?: string; taskId?: string; blockId?: string; moves?: Array<{ blockId: string }> };
-    const beforeState = change.beforeState as { operation?: string; date?: string; fromDate?: string; toDate?: string; taskId?: string; blockId?: string; fromStartMinutes?: number; preferredStartMinutes?: number | null; durationMinutes?: number; kind?: ScheduleTask["kind"]; movable?: boolean; title?: string; status?: ScheduleTask["status"]; priority?: ScheduleTask["priority"]; notes?: string | null; moves?: Array<{ blockId: string; fromStartMinutes: number }> };
+    const afterState = change.afterState as { operation?: string; action?: DailyCloseAction; date?: string; targetDate?: string; fromDate?: string; toDate?: string; taskId?: string; taskIds?: string[]; blockId?: string; blockIds?: string[]; moves?: Array<{ blockId: string }> };
+    const beforeState = change.beforeState as { operation?: string; action?: DailyCloseAction; date?: string; targetDate?: string; fromDate?: string; toDate?: string; taskId?: string; taskIds?: string[]; blockId?: string; blocks?: ScheduledBlock[]; fromStartMinutes?: number; preferredStartMinutes?: number | null; durationMinutes?: number; kind?: ScheduleTask["kind"]; movable?: boolean; title?: string; status?: ScheduleTask["status"]; priority?: ScheduleTask["priority"]; reminderPolicy?: ScheduleTask["reminderPolicy"]; notes?: string | null; moves?: Array<{ blockId: string; fromStartMinutes: number }> };
     await db.transaction(async (tx) => {
       await tx.delete(reminders).where(and(eq(reminders.workspaceId, WORKSPACE_ID), like(reminders.dedupeKey, `change:${changeSetId}:%`)));
       if (beforeState.operation === "task_update" && beforeState.taskId) {
-        await tx.update(tasks).set({ title: beforeState.title, status: beforeState.status, priority: beforeState.priority, notes: beforeState.notes, updatedAt: new Date() }).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, beforeState.taskId)));
+        await tx.update(tasks).set({ title: beforeState.title, status: beforeState.status, priority: beforeState.priority, reminderPolicy: beforeState.reminderPolicy, notes: beforeState.notes, updatedAt: new Date() }).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, beforeState.taskId)));
+        const [restoredTask] = await tx.select().from(tasks).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, beforeState.taskId))).limit(1);
+        const [restoredBlock] = await tx.select().from(scheduleBlocks).where(and(eq(scheduleBlocks.workspaceId, WORKSPACE_ID), eq(scheduleBlocks.taskId, beforeState.taskId))).limit(1);
+        if (restoredTask && restoredBlock) {
+          await tx.delete(reminders).where(and(eq(reminders.workspaceId, WORKSPACE_ID), eq(reminders.taskId, beforeState.taskId), eq(reminders.kind, "start"), eq(reminders.status, "pending")));
+          await enqueueStartReminder(tx, toBlock(restoredBlock, restoredTask), toTask(restoredTask));
+        }
       } else if (beforeState.operation === "place" && beforeState.taskId) {
         await tx.delete(reminders).where(and(eq(reminders.workspaceId, WORKSPACE_ID), eq(reminders.taskId, beforeState.taskId)));
         if (afterState.blockId) await tx.delete(scheduleBlocks).where(and(eq(scheduleBlocks.workspaceId, WORKSPACE_ID), eq(scheduleBlocks.id, afterState.blockId)));
         await tx.update(tasks).set({ date: beforeState.fromDate ?? beforeState.date, preferredStartMinutes: beforeState.preferredStartMinutes ?? null, updatedAt: new Date() }).where(and(eq(tasks.workspaceId, WORKSPACE_ID), eq(tasks.id, beforeState.taskId)));
+      } else if (beforeState.operation === "arrange_batch") {
+        const taskIds = afterState.taskIds ?? [];
+        const blockIds = afterState.blockIds ?? [];
+        if (taskIds.length > 0) await tx.delete(reminders).where(and(eq(reminders.workspaceId, WORKSPACE_ID), inArray(reminders.taskId, taskIds)));
+        if (blockIds.length > 0) await tx.delete(scheduleBlocks).where(and(eq(scheduleBlocks.workspaceId, WORKSPACE_ID), inArray(scheduleBlocks.id, blockIds)));
+      } else if (beforeState.operation === "daily_close") {
+        const taskIds = beforeState.taskIds ?? [];
+        if (taskIds.length > 0) {
+          await tx.delete(reminders).where(and(eq(reminders.workspaceId, WORKSPACE_ID), inArray(reminders.taskId, taskIds)));
+          if (beforeState.action === "move_tomorrow" && beforeState.date) await tx.update(tasks).set({ date: beforeState.date, updatedAt: new Date() }).where(and(eq(tasks.workspaceId, WORKSPACE_ID), inArray(tasks.id, taskIds)));
+        }
+        for (const block of beforeState.blocks ?? []) {
+          await tx.insert(scheduleBlocks).values({ id: block.id, workspaceId: WORKSPACE_ID, taskId: block.taskId, date: block.date, startMinutes: block.startMinutes, durationMinutes: block.durationMinutes, kind: block.kind, movable: block.movable }).onConflictDoNothing();
+          await enqueueStartReminder(tx, block);
+        }
       } else if (beforeState.operation === "reschedule" && beforeState.blockId && beforeState.taskId) {
         await tx.delete(reminders).where(and(eq(reminders.workspaceId, WORKSPACE_ID), eq(reminders.taskId, beforeState.taskId)));
         const fromDate = beforeState.fromDate ?? beforeState.date;

@@ -20,6 +20,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | Initial |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | Initial |
 | [Schedule API Contracts](./api-contracts.md) | Schedule snapshot and command API boundaries | Initial |
+| [Important Reminder Policy](./reminder-policy.md) | Task overrides, conditional summaries, outbox reasons, and channel boundary | Active |
 
 ---
 
